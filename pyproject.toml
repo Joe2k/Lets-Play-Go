@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lets-play-go"
+version = "0.1.0"
+description = "9x9 Go engine with MCTS AI"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["engine", "ai", "gui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
