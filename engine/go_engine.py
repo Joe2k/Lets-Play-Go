@@ -108,6 +108,7 @@ class GoGame:
         black_stones = sum(1 for v in self.board if v == BLACK)
         white_stones = sum(1 for v in self.board if v == WHITE)
         black_territory, white_territory = self._territory()
+        neutral_points = self.board.count(EMPTY) - black_territory - white_territory
 
         black_total = black_stones + black_territory
         white_total = white_stones + white_territory + KOMI
@@ -124,6 +125,7 @@ class GoGame:
             "white_stones": white_stones,
             "black_territory": black_territory,
             "white_territory": white_territory,
+            "neutral_points": neutral_points,
             "komi": KOMI,
             "winner": winner,
         }

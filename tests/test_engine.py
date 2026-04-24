@@ -208,6 +208,7 @@ def test_score_empty_board():
     assert r["white"] == pytest.approx(KOMI)
     assert r["black_territory"] == 0
     assert r["white_territory"] == 0
+    assert r["neutral_points"] == SIZE * SIZE
     assert r["winner"] == WHITE
 
 
@@ -225,6 +226,7 @@ def test_score_clean_territory_split():
     assert r["white_stones"] == SIZE
     assert r["black_territory"] == 27
     assert r["white_territory"] == 27
+    assert r["neutral_points"] == 9
     assert r["black"] == SIZE + 27
     assert r["white"] == pytest.approx(SIZE + 27 + KOMI)
     assert r["winner"] == WHITE
@@ -240,6 +242,7 @@ def test_score_dame_not_counted():
     r = g.score()
     assert r["black_territory"] == 0
     assert r["white_territory"] == 0
+    assert r["neutral_points"] == SIZE * SIZE - 2
     assert r["black_stones"] == 1
     assert r["white_stones"] == 1
     assert r["black"] == 1

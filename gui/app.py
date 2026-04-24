@@ -369,6 +369,8 @@ class App:
         )
         self.screen.blit(bs, (SIDEBAR_X, y + 22))
         self.screen.blit(ws, (SIDEBAR_X, y + 40))
+        ns = self.small_font.render(f"Neutral: {sc['neutral_points']}", True, TEXT_C)
+        self.screen.blit(ns, (SIDEBAR_X, y + 58))
 
         y += 75
         you_color = "Black" if self.human_color == BLACK else "White"
@@ -435,6 +437,7 @@ class App:
         lines = [
             f"Black: {s['black_stones']} stones + {s['black_territory']} territory = {s['black']:.1f}",
             f"White: {s['white_stones']} + {s['white_territory']} + {s['komi']} komi = {s['white']:.1f}",
+            f"Neutral (dame): {s['neutral_points']}",
         ]
         for i, line in enumerate(lines):
             t = self.small_font.render(line, True, OVERLAY_TEXT_C)
