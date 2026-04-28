@@ -112,6 +112,64 @@ This test deliberately reaches into the agent's internals (`_root`, `_advance_ro
 
 ---
 
+## 7. `test_tactical_override_prefers_immediate_capture`
+
+**What it checks:** the tactical pre-search layer returns a direct capture when one is immediately available.
+
+Setup (White stone at `(0,0)` has one liberty at `(0,1)`; Black to move):
+
+```
+W . . . . . . . .
+B . . . . . . . .
+. . . . . . . . .
+...
+```
+
+| Input | Expected |
+|---|---|
+| `tactical_override_move(g)` | `(0, 1)` |
+
+**Why it matters:** this test guards the new anti-blunder logic that handles obvious tactical captures without waiting for MCTS rollouts to discover them.
+
+---
+
+## 8. `test_tactical_override_returns_none_without_urgent_move`
+
+**What it checks:** on a normal opening position with no immediate tactical emergency, tactical override stays out of the way.
+
+| Input | Expected |
+|---|---|
+| `tactical_override_move(GoGame())` | `None` |
+
+**Why it matters:** tactical override should be conservative; if it triggers too often, it can fight the search instead of helping it.
+
+---
+
+## 9. `test_progressive_widening_limit_grows_with_visits`
+
+**What it checks:** the node expansion budget increases as visit count increases.
+
+| Step | Action | Expected |
+|---|---|---|
+| 1 | Create root node on empty board | capture baseline `_expansion_limit()` |
+| 2 | Set `node.visits = 400` | `_expansion_limit()` is larger than baseline |
+
+**Why it matters:** this verifies progressive widening is active (narrow early, wider later), replacing a fixed branching cap.
+
+---
+
+## 10. `test_search_populates_rave_statistics`
+
+**What it checks:** running search records AMAF/RAVE counts at the root.
+
+| Input | Expected |
+|---|---|
+| run `search(..., iterations=40)` from empty board | `root.visits == 40`, root has children, and `root.rave_visits` has at least one move with count >= 1 |
+
+**Why it matters:** this guards the RAVE data path end-to-end (selection + rollout + backprop), not just the presence of fields on the node.
+
+---
+
 ## What these tests deliberately don't cover
 
 - **Strength.** "Does MCTS beat a uniformly random player?" or "does it pick optimal moves in tactical positions?" are benchmark questions, not sanity questions. They need carefully designed positions and many iterations to produce stable answers, and they belong in a separate benchmark suite if at all.
@@ -128,10 +186,31 @@ From the repo root with the project's `.venv` activated:
 pytest -v tests/test_mcts.py
 ```
 
-All 6 tests should pass in under 10 seconds. To run them alongside the engine tests:
+All 10 tests should pass. To run them alongside the engine tests:
 
 ```bash
 pytest -v tests/
 ```
 
-That's 23 tests total (17 engine + 6 MCTS). If one fails, the test name tells you which contract regressed.
+That is 27 tests total (17 engine + 10 MCTS). If one fails, the test name tells you which contract regressed.
+
+---
+
+## Quick strength evaluation (not unit tests)
+
+For fast A/B strength checks between two MCTS configurations, use:
+
+```bash
+python3 scripts/eval_match.py --games 20 --a-name New --a-iters 400 --b-name Baseline --b-iters 200
+```
+
+This alternates colors each game and reports:
+- win rate for each config
+- average score margin
+- average move latency per config
+
+To save per-game rows for tracking over time:
+
+```bash
+python3 scripts/eval_match.py --games 50 --a-name New --a-iters 400 --b-name Old --b-iters 400 --csv eval_results.csv
+```

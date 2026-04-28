@@ -13,14 +13,13 @@ non-eye-filling moves on the actual board.
 
 from __future__ import annotations
 
-import copy
 import math
 import random
 from typing import Optional, Union
 
 from engine.go_engine import GoGame
 
-from .mcts import Node, best_move, candidate_moves, search
+from .mcts import Node, best_move, candidate_moves, search, tactical_override_move
 
 _DEFAULT_C = math.sqrt(2)
 
@@ -47,8 +46,13 @@ class MCTSAgent:
             self._root = None
             return "pass"
 
+        tactical = tactical_override_move(game)
+        if tactical is not None:
+            self._root = None
+            return tactical
+
         self._advance_root_to(game)
-        search_game = copy.deepcopy(game)
+        search_game = game.clone_fast()
         search(search_game, self._root, self.iterations, self.c, self._rng)
 
         move = best_move(self._root)

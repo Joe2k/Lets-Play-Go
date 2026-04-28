@@ -2,7 +2,7 @@
 
 from engine.go_engine import BLACK, EMPTY, SIZE, WHITE, GoGame
 from ai.agent import MCTSAgent
-from ai.mcts import candidate_moves
+from ai.mcts import Node, candidate_moves, search, tactical_override_move
 
 
 def _blank():
@@ -93,3 +93,39 @@ def test_seed_determinism():
     a1 = MCTSAgent(iterations=100, seed=42)
     a2 = MCTSAgent(iterations=100, seed=42)
     assert a1.select_move(g1) == a2.select_move(g2)
+
+
+def test_tactical_override_prefers_immediate_capture():
+    # White stone at (0,0) is in atari; Black should take (0,1) immediately.
+    b = _blank()
+    b[0][0] = WHITE
+    b[1][0] = BLACK
+    g = GoGame.from_position(b, to_move=BLACK)
+    assert tactical_override_move(g) == (0, 1)
+
+
+def test_tactical_override_returns_none_without_urgent_move():
+    g = GoGame()
+    assert tactical_override_move(g) is None
+
+
+def test_progressive_widening_limit_grows_with_visits():
+    g = GoGame()
+    n = Node(parent=None, move=None, game=g)
+    low = n._expansion_limit()
+    n.visits = 400
+    high = n._expansion_limit()
+    assert high > low
+
+
+def test_search_populates_rave_statistics():
+    g = GoGame()
+    root = Node(parent=None, move=None, game=g)
+    import random
+    rng = random.Random(0)
+    search(g.clone_fast(), root, iterations=40, c=1.4, rng=rng)
+    assert root.visits == 40
+    assert len(root.children) > 0
+    assert len(root.rave_visits) > 0
+    some_move = next(iter(root.rave_visits))
+    assert root.rave_visits[some_move] >= 1

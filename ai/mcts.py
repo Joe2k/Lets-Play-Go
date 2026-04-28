@@ -43,16 +43,22 @@ That keeps the inner loop fast - is_legal in the hot path was costing
 
 from __future__ import annotations
 
-import copy
+import heapq
 import math
 import random
 from typing import Optional
 
-from engine.go_engine import EMPTY, SIZE, GoGame
+from engine.go_engine import BLACK, EMPTY, SIZE, WHITE, GoGame
 
 _NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 _DEFAULT_C = math.sqrt(2)
 _ROLLOUT_MOVE_CAP = 200
+_TREE_MIN_KEEP = 12
+_ROLLOUT_TOP_WINDOW = 8
+_ENDGAME_EMPTY_THRESHOLD = 20
+_PROG_WIDEN_K = 2.2
+_PROG_WIDEN_ALPHA = 0.55
+_RAVE_EQUIV = 120.0
 
 
 def _is_own_eye(board_flat: list[int], r: int, c: int, color: int) -> bool:
@@ -73,6 +79,52 @@ def _is_own_eye(board_flat: list[int], r: int, c: int, color: int) -> bool:
     return True
 
 
+def _other_color(color: int) -> int:
+    return WHITE if color == BLACK else BLACK
+
+
+def _move_features(game: GoGame, move: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Return cheap tactical features for move ordering.
+
+    Features are (capture_size, escapes_atari, adjacent_stones, center_bonus).
+    """
+    r, c = move
+    me = game.to_move
+    opp = _other_color(me)
+    capture_size = 0
+    escapes_atari = 0
+    adjacent_stones = 0
+
+    for dr, dc in _NEIGHBORS:
+        nr, nc = r + dr, c + dc
+        if not (0 <= nr < SIZE and 0 <= nc < SIZE):
+            continue
+        v = game.board[nr * SIZE + nc]
+        if v == EMPTY:
+            continue
+        adjacent_stones += 1
+        stones, liberties = game._group(nr, nc)  # private helper, cheap and deterministic
+        if v == opp and len(liberties) == 1:
+            capture_size += len(stones)
+        elif v == me and len(liberties) == 1:
+            escapes_atari = 1
+
+    center = (SIZE - 1) / 2
+    center_bonus = int(8 - (abs(r - center) + abs(c - center)))
+    return capture_size, escapes_atari, adjacent_stones, center_bonus
+
+
+def _move_priority(game: GoGame, move: tuple[int, int]) -> int:
+    cap, escape, adj, center = _move_features(game, move)
+    # Captures dominate, then urgent defense, then local play.
+    priority = 100 * cap + 35 * escape + 8 * adj + center
+    if game.board.count(EMPTY) <= _ENDGAME_EMPTY_THRESHOLD:
+        # In late game, de-prioritize quiet center-ish plays.
+        if cap == 0 and escape == 0 and adj <= 1:
+            priority -= 18
+    return priority
+
+
 def candidate_moves(game: GoGame) -> list[tuple[int, int]]:
     """Empty points that aren't own-eyes. May include suicide/ko moves;
     those are filtered downstream by place_stone returning False."""
@@ -89,10 +141,32 @@ def candidate_moves(game: GoGame) -> list[tuple[int, int]]:
     return out
 
 
+def tree_candidate_moves(game: GoGame) -> list[tuple[int, int]]:
+    """Priority-ordered tactical candidate set for tree expansion."""
+    cands = candidate_moves(game)
+    return sorted(cands, key=lambda m: _move_priority(game, m), reverse=True)
+
+
+def tactical_override_move(game: GoGame) -> Optional[tuple[int, int]]:
+    """Conservative tactical override: prefer urgent captures/saves."""
+    cands = candidate_moves(game)
+    if not cands:
+        return None
+    ranked = sorted(cands, key=lambda m: _move_priority(game, m), reverse=True)
+    for move in ranked[:10]:
+        cap, escape, _, _ = _move_features(game, move)
+        if cap >= 1 or escape >= 1:
+            probe = game.clone_fast()
+            if probe.place_stone(*move):
+                return move
+    return None
+
+
 class Node:
     __slots__ = (
         "parent", "move", "to_move", "children",
-        "untried_moves", "visits", "wins", "is_terminal",
+        "ordered_moves", "next_untried_idx", "visits", "wins", "is_terminal",
+        "rave_wins", "rave_visits",
     )
 
     def __init__(
@@ -105,20 +179,37 @@ class Node:
         self.move = move
         self.to_move = game.to_move
         self.children: dict[tuple[int, int], "Node"] = {}
-        self.untried_moves: list[tuple[int, int]] = candidate_moves(game)
+        self.ordered_moves: list[tuple[int, int]] = tree_candidate_moves(game)
+        self.next_untried_idx = 0
         self.visits = 0
         self.wins = 0.0
-        self.is_terminal = len(self.untried_moves) == 0
+        self.is_terminal = len(self.ordered_moves) == 0
+        self.rave_wins: dict[tuple[int, int], float] = {}
+        self.rave_visits: dict[tuple[int, int], int] = {}
 
     def is_fully_expanded(self) -> bool:
-        return not self.untried_moves
+        if self.is_terminal:
+            return True
+        return len(self.children) >= self._expansion_limit()
+
+    def _expansion_limit(self) -> int:
+        if self.visits == 0:
+            return _TREE_MIN_KEEP
+        widened = int(_PROG_WIDEN_K * (self.visits ** _PROG_WIDEN_ALPHA))
+        return max(_TREE_MIN_KEEP, widened)
 
     def best_child_uct(self, c: float) -> "Node":
         log_n = math.log(self.visits)
         best: Optional[Node] = None
         best_score = -math.inf
-        for child in self.children.values():
-            score = (child.wins / child.visits) + c * math.sqrt(log_n / child.visits)
+        for move, child in self.children.items():
+            q = child.wins / child.visits
+            r_n = self.rave_visits.get(move, 0)
+            if r_n:
+                r_q = self.rave_wins.get(move, 0.0) / r_n
+                beta = _RAVE_EQUIV / (_RAVE_EQUIV + child.visits)
+                q = (1.0 - beta) * q + beta * r_q
+            score = q + c * math.sqrt(log_n / child.visits)
             if score > best_score:
                 best_score = score
                 best = child
@@ -126,54 +217,97 @@ class Node:
         return best
 
 
-def _select(root: Node, game: GoGame, c: float) -> tuple[Node, GoGame]:
+def _select(root: Node, game: GoGame, c: float) -> tuple[Node, GoGame, list[tuple[int, int]]]:
     node = root
+    path_moves: list[tuple[int, int]] = []
     while not node.is_terminal and node.is_fully_expanded() and node.children:
         node = node.best_child_uct(c)
-        game.place_stone(*node.move)
-    return node, game
+        mover = game.to_move
+        if game.place_stone(*node.move):
+            path_moves.append((mover, node.move))
+    return node, game, path_moves
 
 
-def _expand(node: Node, game: GoGame, rng: random.Random) -> tuple[Node, GoGame]:
-    """Try untried moves until one is legal; create a child for it. If
-    every untried move turns out illegal (suicide/ko), mark the node
-    terminal and return it unchanged."""
+def _expand(node: Node, game: GoGame, rng: random.Random) -> tuple[Node, GoGame, list[tuple[int, int]]]:
+    """Expand one legal child if progressive widening allows it."""
     if node.is_terminal:
-        return node, game
-    while node.untried_moves:
-        idx = rng.randrange(len(node.untried_moves))
-        move = node.untried_moves.pop(idx)
+        return node, game, []
+    if node.is_fully_expanded():
+        return node, game, []
+    expanded: list[tuple[int, int]] = []
+    while node.next_untried_idx < len(node.ordered_moves):
+        top = min(len(node.ordered_moves), node.next_untried_idx + 6)
+        idx = rng.randrange(node.next_untried_idx, top)
+        move = node.ordered_moves[idx]
+        node.ordered_moves[idx], node.ordered_moves[node.next_untried_idx] = (
+            node.ordered_moves[node.next_untried_idx], node.ordered_moves[idx]
+        )
+        node.next_untried_idx += 1
+        if move in node.children:
+            continue
+        mover = game.to_move
         if game.place_stone(*move):
             child = Node(parent=node, move=move, game=game)
             node.children[move] = child
-            return child, game
+            expanded.append((mover, move))
+            return child, game, expanded
     if not node.children:
         node.is_terminal = True
-    return node, game
+    return node, game, expanded
 
 
-def _simulate(game: GoGame, rng: random.Random) -> int:
-    """Random rollout to a scored end. Returns BLACK or WHITE."""
+def _simulate(game: GoGame, rng: random.Random) -> tuple[int, list[tuple[int, int]]]:
+    """Heuristic-biased rollout to a scored end. Returns winner and played moves."""
+    played: list[tuple[int, int]] = []
     for _ in range(_ROLLOUT_MOVE_CAP):
         cands = candidate_moves(game)
         if not cands:
             break
-        rng.shuffle(cands)
-        for move in cands:
+        top_window = _ROLLOUT_TOP_WINDOW
+        if game.board.count(EMPTY) <= _ENDGAME_EMPTY_THRESHOLD:
+            top_window = 5
+        if len(cands) <= top_window:
+            window = cands
+            weighted = [(move, 1.0 + max(0, _move_priority(game, move)) / 100.0) for move in window]
+        else:
+            scored = [(_move_priority(game, move), move) for move in cands]
+            top = heapq.nlargest(top_window, scored, key=lambda t: t[0])
+            weighted = [(move, 1.0 + max(0, score) / 100.0) for score, move in top]
+            window = [move for _, move in top]
+        # Prefer tactical/local moves but keep randomness for exploration.
+        tried = set()
+        for _ in range(len(window)):
+            moves, weights = zip(*[(m, w) for (m, w) in weighted if m not in tried])
+            move = rng.choices(moves, weights=weights, k=1)[0]
+            tried.add(move)
+            mover = game.to_move
             if game.place_stone(*move):
+                played.append((mover, move))
                 break
         else:
             break  # every candidate was illegal (rare)
-    return game.score()["winner"]
+    return game.score()["winner"], played
 
 
-def _backprop(node: Optional[Node], winner: int) -> None:
+def _backprop(
+    node: Optional[Node],
+    winner: int,
+    played_moves: list[tuple[int, int]],
+) -> None:
+    moves_by_player = {BLACK: set(), WHITE: set()}
+    for player, move in played_moves:
+        moves_by_player[player].add(move)
+
     while node is not None:
         node.visits += 1
         # node was reached via a move chosen by node.parent.to_move.
         # Increment wins on nodes whose mover (parent.to_move) won.
         if node.parent is not None and node.parent.to_move == winner:
             node.wins += 1.0
+        for move in moves_by_player[node.to_move]:
+            node.rave_visits[move] = node.rave_visits.get(move, 0) + 1
+            if winner == node.to_move:
+                node.rave_wins[move] = node.rave_wins.get(move, 0.0) + 1.0
         node = node.parent
 
 
@@ -186,11 +320,11 @@ def search(
 ) -> None:
     """Run `iterations` MCTS iterations from `root` (mutates root in place)."""
     for _ in range(iterations):
-        game = copy.deepcopy(root_game)
-        node, game = _select(root, game, c)
-        node, game = _expand(node, game, rng)
-        winner = _simulate(game, rng)
-        _backprop(node, winner)
+        game = root_game.clone_fast()
+        node, game, path_moves = _select(root, game, c)
+        node, game, expanded_moves = _expand(node, game, rng)
+        winner, rollout_moves = _simulate(game, rng)
+        _backprop(node, winner, path_moves + expanded_moves + rollout_moves)
 
 
 def best_move(root: Node) -> Optional[tuple[int, int]]:
