@@ -1,0 +1,347 @@
+"""Iterative self-play / train / gate pipeline.
+
+Runs generations 0..N end-to-end:
+
+    gen 0:  uniform predictor -> data_g0 -> train pv_g0 (best := pv_g0)
+    gen i:  best -> data_gi -> train pv_gi (init-from best) ->
+            gate eval pv_gi vs best -> promote if win-rate >= threshold
+
+State (current best checkpoint, per-gen status) is persisted in
+`<run-dir>/state.json` so re-running the script resumes where it left
+off — completed steps are skipped automatically.
+
+Each generation also appends a row to `<run-dir>/pipeline.log.jsonl`
+with timing, win rate, and promotion outcome.
+
+Stop the script at any time with Ctrl+C; the underlying scripts each
+have their own checkpointing so accumulated work is preserved.
+
+Example:
+
+    .venv/bin/python scripts/run_pipeline.py --generations 4 \\
+        --games 30 --self-play-iters 200 \\
+        --epochs 10 --eval-games 20 --eval-iters 200 \\
+        --gate-threshold 0.52 --device mps
+
+To resume the same run later:
+
+    .venv/bin/python scripts/run_pipeline.py --generations 6 \\
+        --run-dir runs/default
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import pathlib
+import subprocess
+import sys
+import time
+from typing import Optional
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PYTHON = str(ROOT / ".venv" / "bin" / "python")
+
+
+def _now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _run(cmd: list[str]) -> int:
+    """Run a subprocess, streaming stdout/stderr to the parent terminal."""
+    print(f"\n$ {' '.join(cmd)}\n", flush=True)
+    return subprocess.call(cmd)
+
+
+def _check(cmd: list[str], allow_codes: tuple[int, ...] = (0,)) -> int:
+    rc = _run(cmd)
+    if rc not in allow_codes:
+        print(f"command exited with code {rc}; aborting pipeline.", file=sys.stderr)
+        sys.exit(rc)
+    return rc
+
+
+class PipelineState:
+    def __init__(self, run_dir: pathlib.Path) -> None:
+        self.run_dir = run_dir
+        self.state_path = run_dir / "state.json"
+        self.log_path = run_dir / "pipeline.log.jsonl"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        if self.state_path.exists():
+            with self.state_path.open("r") as f:
+                self.data = json.load(f)
+        else:
+            self.data = {
+                "best_checkpoint": None,
+                "best_gen": None,
+                "generations": {},  # str(gen_idx) -> dict
+            }
+            self._save()
+
+    def _save(self) -> None:
+        with self.state_path.open("w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def gen(self, idx: int) -> dict:
+        return self.data["generations"].setdefault(str(idx), {})
+
+    def update_gen(self, idx: int, **kwargs) -> None:
+        self.gen(idx).update(kwargs)
+        self._save()
+
+    def set_best(self, gen_idx: int, checkpoint: str) -> None:
+        self.data["best_checkpoint"] = checkpoint
+        self.data["best_gen"] = gen_idx
+        self._save()
+
+    def best_checkpoint(self) -> Optional[str]:
+        return self.data.get("best_checkpoint")
+
+    def append_log(self, entry: dict) -> None:
+        with self.log_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+def _self_play(
+    state: PipelineState,
+    gen_idx: int,
+    out_path: pathlib.Path,
+    games: int,
+    iterations: int,
+    device: str,
+    seed_base: int,
+    workers: int = 1,
+) -> None:
+    if out_path.exists() and state.gen(gen_idx).get("self_play_done"):
+        print(f"[gen {gen_idx}] self-play already complete, skipping.")
+        return
+
+    cmd = [
+        PYTHON,
+        str(ROOT / "scripts" / "generate_selfplay_data.py"),
+        "--games", str(games),
+        "--iterations", str(iterations),
+        "--seed", str(seed_base + 100 * gen_idx),
+        "--output", str(out_path),
+        "--device", device,
+        "--workers", str(workers),
+    ]
+    predictor = state.best_checkpoint()
+    if predictor is not None:
+        cmd += ["--predictor-checkpoint", predictor]
+
+    started = time.perf_counter()
+    _check(cmd)
+    elapsed = time.perf_counter() - started
+    state.update_gen(gen_idx, self_play_done=True, self_play_seconds=elapsed,
+                     self_play_path=str(out_path))
+
+
+def _train(
+    state: PipelineState,
+    gen_idx: int,
+    data_path: pathlib.Path,
+    out_path: pathlib.Path,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: str,
+) -> None:
+    if out_path.exists() and state.gen(gen_idx).get("train_done"):
+        print(f"[gen {gen_idx}] training already complete, skipping.")
+        return
+
+    cmd = [
+        PYTHON,
+        str(ROOT / "scripts" / "train_policy_value.py"),
+        "--data", str(data_path),
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--lr", str(lr),
+        "--out", str(out_path),
+        "--device", device,
+    ]
+    init_from = state.best_checkpoint()
+    if init_from is not None:
+        cmd += ["--init-from", init_from]
+
+    started = time.perf_counter()
+    _check(cmd)
+    elapsed = time.perf_counter() - started
+    state.update_gen(gen_idx, train_done=True, train_seconds=elapsed,
+                     checkpoint_path=str(out_path))
+
+
+def _gate_eval(
+    state: PipelineState,
+    gen_idx: int,
+    new_checkpoint: pathlib.Path,
+    games: int,
+    iterations: int,
+    threshold: float,
+    csv_path: pathlib.Path,
+) -> tuple[bool, Optional[float]]:
+    """Returns (promoted, win_rate). Win rate is None if eval was skipped."""
+    if state.gen(gen_idx).get("eval_done"):
+        wr = state.gen(gen_idx).get("eval_winrate")
+        promoted = state.gen(gen_idx).get("promoted", False)
+        print(f"[gen {gen_idx}] gate eval already complete (winrate={wr}, promoted={promoted}); skipping.")
+        return promoted, wr
+
+    best = state.best_checkpoint()
+    if best is None:
+        # Gen 0: nothing to compare against — auto-promote.
+        state.update_gen(gen_idx, eval_done=True, eval_winrate=None, promoted=True)
+        return True, None
+
+    cmd = [
+        PYTHON,
+        str(ROOT / "scripts" / "eval_match.py"),
+        "--games", str(games),
+        "--a-name", f"gen{gen_idx}",
+        "--a-engine", "puct",
+        "--a-model", str(new_checkpoint),
+        "--a-iters", str(iterations),
+        "--b-name", f"best_gen{state.data.get('best_gen')}",
+        "--b-engine", "puct",
+        "--b-model", best,
+        "--b-iters", str(iterations),
+        "--csv", str(csv_path),
+        "--gate-threshold", str(threshold),
+    ]
+    started = time.perf_counter()
+    rc = _run(cmd)
+    elapsed = time.perf_counter() - started
+    promoted = rc == 0
+    # Parse the win rate out of the per-game CSV (last match_id rows).
+    win_rate = _winrate_from_csv(csv_path, expected_a_name=f"gen{gen_idx}")
+    state.update_gen(
+        gen_idx,
+        eval_done=True,
+        eval_seconds=elapsed,
+        eval_winrate=win_rate,
+        promoted=promoted,
+    )
+    return promoted, win_rate
+
+
+def _winrate_from_csv(csv_path: pathlib.Path, expected_a_name: str) -> Optional[float]:
+    """Compute A's win rate from the most recent match_id matching expected_a_name."""
+    if not csv_path.exists():
+        return None
+    import csv as _csv
+    with csv_path.open("r", newline="") as f:
+        rows = list(_csv.DictReader(f))
+    if not rows:
+        return None
+    # Find the latest match_id that involves expected_a_name.
+    relevant = [r for r in rows if expected_a_name in (r.get("black_name"), r.get("white_name"))]
+    if not relevant:
+        return None
+    last_match_id = relevant[-1]["match_id"]
+    match_rows = [r for r in relevant if r["match_id"] == last_match_id]
+    if not match_rows:
+        return None
+    wins = sum(1 for r in match_rows if r["winner_name"] == expected_a_name)
+    return wins / len(match_rows)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Run iterative RL pipeline")
+    p.add_argument("--generations", type=int, default=3,
+                   help="Number of generations to run (gen_0 through gen_{N-1}).")
+    p.add_argument("--start-gen", type=int, default=0,
+                   help="Resume from this generation (skip earlier gens).")
+    p.add_argument("--run-dir", type=str, default="runs/default",
+                   help="Directory holding state.json, datasets, checkpoints, and logs.")
+    p.add_argument("--games", type=int, default=30,
+                   help="Self-play games per generation.")
+    p.add_argument("--self-play-iters", type=int, default=200,
+                   help="MCTS/PUCT iterations per move during self-play.")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--eval-games", type=int, default=20,
+                   help="Games per gate-eval match.")
+    p.add_argument("--eval-iters", type=int, default=200)
+    p.add_argument("--gate-threshold", type=float, default=0.52,
+                   help="Win rate needed to promote a new checkpoint.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel workers for self-play data generation.")
+    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--seed-base", type=int, default=0)
+    args = p.parse_args()
+
+    run_dir = pathlib.Path(args.run_dir)
+    data_dir = run_dir / "data"
+    ckpt_dir = run_dir / "checkpoints"
+    eval_csv = run_dir / "eval.csv"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    state = PipelineState(run_dir)
+    print(f"=== pipeline start @ {_now()} ===")
+    print(f"run_dir: {run_dir}")
+    print(f"current best: {state.best_checkpoint() or '(none)'}\n")
+
+    overall_started = time.perf_counter()
+    for gen in range(args.start_gen, args.generations):
+        gen_started = time.perf_counter()
+        print(f"\n========== generation {gen} ==========")
+        data_path = data_dir / f"selfplay_g{gen}.pt"
+        ckpt_path = ckpt_dir / f"pv_g{gen}.pt"
+
+        _self_play(state, gen, data_path,
+                   games=args.games,
+                   iterations=args.self_play_iters,
+                   device=args.device,
+                   seed_base=args.seed_base,
+                   workers=args.workers)
+
+        _train(state, gen, data_path, ckpt_path,
+               epochs=args.epochs,
+               batch_size=args.batch_size,
+               lr=args.lr,
+               device=args.device)
+
+        promoted, win_rate = _gate_eval(
+            state, gen, ckpt_path,
+            games=args.eval_games,
+            iterations=args.eval_iters,
+            threshold=args.gate_threshold,
+            csv_path=eval_csv,
+        )
+
+        if promoted:
+            state.set_best(gen, str(ckpt_path))
+            verdict = "PROMOTED"
+        else:
+            verdict = "REJECTED (keeping previous best)"
+        gen_elapsed = time.perf_counter() - gen_started
+        wr_str = f"{win_rate*100:.1f}%" if win_rate is not None else "n/a"
+
+        log_entry = {
+            "timestamp": _now(),
+            "gen": gen,
+            "win_rate": win_rate,
+            "promoted": promoted,
+            "best_after": state.best_checkpoint(),
+            "elapsed_seconds": gen_elapsed,
+        }
+        state.append_log(log_entry)
+
+        print(f"\n[gen {gen}] {verdict} | win_rate={wr_str} | gen_time={gen_elapsed:.1f}s")
+        print(f"[gen {gen}] best_checkpoint={state.best_checkpoint()}")
+
+    print(f"\n=== pipeline finished | total {time.perf_counter()-overall_started:.1f}s ===")
+    print(f"final best: {state.best_checkpoint()}")
+    print(f"per-gen log: {state.log_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nPipeline interrupted. State saved — re-run the same command to resume.")
+        sys.exit(0)

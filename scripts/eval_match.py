@@ -80,6 +80,7 @@ def _build_agent(spec: AgentSpec, seed: int):
             iterations=spec.iterations,
             model_path=spec.model_path,
             seed=seed,
+            add_root_noise=True,
         )
     return MCTSAgent(iterations=spec.iterations, seed=seed)
 
