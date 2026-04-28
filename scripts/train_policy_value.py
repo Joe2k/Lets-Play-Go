@@ -82,40 +82,50 @@ def main() -> None:
     model.train()
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    indices = list(range(n))
-    for epoch in range(1, args.epochs + 1):
-        random.shuffle(indices)
-        epoch_loss = 0.0
-        batches = 0
-        for s in range(0, n, args.batch_size):
-            batch_idx = indices[s:s + args.batch_size]
-            x = states[batch_idx].to(device)
-            p_t = policy[batch_idx].to(device)
-            v_t = value[batch_idx].to(device)
-
-            if not args.no_augment:
-                x, p_t = _augment_batch(x, p_t)
-                v_t = v_t.repeat(8)
-
-            logits, v_pred = model(x)
-            logp = torch.log_softmax(logits, dim=1)
-            policy_loss = -(p_t * logp).sum(dim=1).mean()
-            value_loss = torch.mean((v_pred - v_t) ** 2)
-            loss = policy_loss + value_loss
-
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-            epoch_loss += float(loss.item())
-            batches += 1
-
-        print(f"epoch {epoch}/{args.epochs} loss={epoch_loss / max(1, batches):.5f}")
-
     out_path = pathlib.Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.state_dict()}, out_path)
-    print(f"saved checkpoint to {out_path}")
+
+    def _save(reason: str) -> None:
+        torch.save({"state_dict": model.state_dict()}, out_path)
+        print(f"[{reason}] saved checkpoint to {out_path}")
+
+    indices = list(range(n))
+    try:
+        for epoch in range(1, args.epochs + 1):
+            random.shuffle(indices)
+            epoch_loss = 0.0
+            batches = 0
+            for s in range(0, n, args.batch_size):
+                batch_idx = indices[s:s + args.batch_size]
+                x = states[batch_idx].to(device)
+                p_t = policy[batch_idx].to(device)
+                v_t = value[batch_idx].to(device)
+
+                if not args.no_augment:
+                    x, p_t = _augment_batch(x, p_t)
+                    v_t = v_t.repeat(8)
+
+                logits, v_pred = model(x)
+                logp = torch.log_softmax(logits, dim=1)
+                policy_loss = -(p_t * logp).sum(dim=1).mean()
+                value_loss = torch.mean((v_pred - v_t) ** 2)
+                loss = policy_loss + value_loss
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                epoch_loss += float(loss.item())
+                batches += 1
+
+            print(f"epoch {epoch}/{args.epochs} loss={epoch_loss / max(1, batches):.5f}")
+            _save(f"epoch {epoch}")
+    except KeyboardInterrupt:
+        print("\nInterrupted — saving latest weights.")
+        _save("interrupted")
+        sys.exit(0)
+
+    _save("done")
 
 
 if __name__ == "__main__":

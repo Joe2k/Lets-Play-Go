@@ -16,6 +16,7 @@ import argparse
 import pathlib
 import random
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -57,6 +58,8 @@ def main() -> None:
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--no-noise", action="store_true",
                    help="Disable Dirichlet root noise (debugging only).")
+    p.add_argument("--save-every", type=int, default=2,
+                   help="Flush partial dataset to --output every N games (Ctrl+C-safe).")
     args = p.parse_args()
 
     rng = random.Random(args.seed)
@@ -74,63 +77,84 @@ def main() -> None:
     player_to_move = []
     values = []
 
-    for gidx in range(args.games):
-        game = GoGame()
-        samples_idx = []
-        for ply in range(args.max_moves):
-            if game.finished:
-                break
-            root = run_puct_search(
-                game=game,
-                predictor=predictor,
-                iterations=args.iterations,
-                c_puct=1.4,
-                add_root_noise=add_root_noise,
-                rng=rng,
-            )
-            if not root.children:
-                game.pass_turn()
-                break
-
-            visit_sum = sum(ch.visit_count for ch in root.children.values())
-            if visit_sum <= 0:
-                game.pass_turn()
-                break
-
-            pol = torch.zeros(81, dtype=torch.float32)
-            visits: dict[tuple[int, int], int] = {}
-            for move, ch in root.children.items():
-                v = ch.visit_count
-                visits[move] = v
-                pol[move[0] * 9 + move[1]] = float(v) / float(visit_sum)
-
-            st = encode_game_tensor(game)[0].cpu()
-            states.append(st)
-            policies.append(pol)
-            player_to_move.append(game.to_move)
-            samples_idx.append(len(states) - 1)
-
-            temp = args.temperature if ply < 20 else max(0.05, args.temperature * 0.25)
-            mv = _sample_from_visits(visits, rng=rng, temperature=temp)
-            if not game.place_stone(*mv):
-                # Defensive fallback.
-                game.pass_turn()
-                break
-
-        winner = game.score()["winner"]
-        for idx in samples_idx:
-            values.append(1.0 if player_to_move[idx] == winner else -1.0)
-        print(f"game {gidx+1}/{args.games}: samples={len(samples_idx)} winner={winner}")
-
     out_path = pathlib.Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    blob = {
-        "states": torch.stack(states) if states else torch.empty((0, 3, 9, 9), dtype=torch.float32),
-        "policy": torch.stack(policies) if policies else torch.empty((0, 81), dtype=torch.float32),
-        "value": torch.tensor(values, dtype=torch.float32) if values else torch.empty((0,), dtype=torch.float32),
-    }
-    torch.save(blob, out_path)
-    print(f"saved {blob['states'].shape[0]} samples to {out_path}")
+
+    def _flush(reason: str) -> None:
+        blob = {
+            "states": torch.stack(states) if states else torch.empty((0, 3, 9, 9), dtype=torch.float32),
+            "policy": torch.stack(policies) if policies else torch.empty((0, 81), dtype=torch.float32),
+            "value": torch.tensor(values, dtype=torch.float32) if values else torch.empty((0,), dtype=torch.float32),
+        }
+        torch.save(blob, out_path)
+        print(f"[{reason}] saved {blob['states'].shape[0]} samples to {out_path}")
+
+    started = time.perf_counter()
+    games_completed = 0
+    try:
+        for gidx in range(args.games):
+            game_start = time.perf_counter()
+            game = GoGame()
+            samples_idx = []
+            for ply in range(args.max_moves):
+                if game.finished:
+                    break
+                root = run_puct_search(
+                    game=game,
+                    predictor=predictor,
+                    iterations=args.iterations,
+                    c_puct=1.4,
+                    add_root_noise=add_root_noise,
+                    rng=rng,
+                )
+                if not root.children:
+                    game.pass_turn()
+                    break
+
+                visit_sum = sum(ch.visit_count for ch in root.children.values())
+                if visit_sum <= 0:
+                    game.pass_turn()
+                    break
+
+                pol = torch.zeros(81, dtype=torch.float32)
+                visits: dict[tuple[int, int], int] = {}
+                for move, ch in root.children.items():
+                    v = ch.visit_count
+                    visits[move] = v
+                    pol[move[0] * 9 + move[1]] = float(v) / float(visit_sum)
+
+                st = encode_game_tensor(game)[0].cpu()
+                states.append(st)
+                policies.append(pol)
+                player_to_move.append(game.to_move)
+                samples_idx.append(len(states) - 1)
+
+                temp = args.temperature if ply < 20 else max(0.05, args.temperature * 0.25)
+                mv = _sample_from_visits(visits, rng=rng, temperature=temp)
+                if not game.place_stone(*mv):
+                    # Defensive fallback.
+                    game.pass_turn()
+                    break
+
+            winner = game.score()["winner"]
+            for idx in samples_idx:
+                values.append(1.0 if player_to_move[idx] == winner else -1.0)
+            games_completed += 1
+            game_dt = time.perf_counter() - game_start
+            total = time.perf_counter() - started
+            print(
+                f"game {gidx+1}/{args.games}: samples={len(samples_idx)} "
+                f"winner={winner} ({game_dt:.1f}s, total {total:.1f}s)"
+            )
+
+            if args.save_every > 0 and games_completed % args.save_every == 0:
+                _flush("checkpoint")
+    except KeyboardInterrupt:
+        print("\nInterrupted — flushing partial dataset.")
+        _flush("interrupted")
+        sys.exit(0)
+
+    _flush("done")
 
 
 if __name__ == "__main__":
