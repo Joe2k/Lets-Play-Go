@@ -28,6 +28,7 @@ from typing import Optional
 import pygame
 
 from ai.agent import MCTSAgent
+from ai.puct_agent import PUCTAgent
 from engine.go_engine import BLACK, EMPTY, SIZE, WHITE, GoGame
 
 # --- Layout ---
@@ -121,6 +122,8 @@ class App:
         self,
         default_human_color: int,
         ai_iterations: int,
+        ai_engine: str,
+        model_path: Optional[str],
         seed: Optional[int],
     ) -> None:
         pygame.init()
@@ -134,10 +137,12 @@ class App:
 
         self.default_human_color = default_human_color
         self.ai_iterations = ai_iterations
+        self.ai_engine = ai_engine
+        self.model_path = model_path
         self.seed = seed
 
         self.game = GoGame()
-        self.agent = MCTSAgent(iterations=ai_iterations, seed=seed)
+        self.agent = self._build_agent()
         self.human_color = default_human_color
         self.state = START_SCREEN
         self.score_dict: Optional[dict] = None
@@ -153,6 +158,11 @@ class App:
         self.start_black_btn = Button((cx - 200, cy + 20, 180, 60), "Black (1st)")
         self.start_white_btn = Button((cx + 20, cy + 20, 180, 60), "White (2nd)")
         self.over_new_btn = Button((cx - 90, cy + 90, 180, 40), "New game")
+
+    def _build_agent(self):
+        if self.ai_engine == "puct":
+            return PUCTAgent(iterations=self.ai_iterations, model_path=self.model_path, seed=self.seed)
+        return MCTSAgent(iterations=self.ai_iterations, seed=self.seed)
 
     # --- Main loop ---
 
@@ -229,7 +239,7 @@ class App:
 
     def _start_game(self, human_color: int) -> None:
         self.game = GoGame()
-        self.agent = MCTSAgent(iterations=self.ai_iterations, seed=self.seed)
+        self.agent = self._build_agent()
         self.human_color = human_color
         self.score_dict = None
         self.confirm_pass = False
@@ -376,7 +386,11 @@ class App:
         you_color = "Black" if self.human_color == BLACK else "White"
         ai_color = "White" if self.human_color == BLACK else "Black"
         ht = self.small_font.render(f"You: {you_color}", True, TEXT_C)
-        at = self.small_font.render(f"AI:  {ai_color}  ({self.ai_iterations} iter)", True, TEXT_C)
+        at = self.small_font.render(
+            f"AI:  {ai_color}  ({self.ai_engine.upper()} {self.ai_iterations} iter)",
+            True,
+            TEXT_C,
+        )
         self.screen.blit(ht, (SIDEBAR_X, y))
         self.screen.blit(at, (SIDEBAR_X, y + 18))
 
@@ -450,19 +464,29 @@ class App:
 def run_app(
     human_color: int = BLACK,
     ai_iterations: int = 400,
+    ai_engine: str = "mcts",
+    model_path: Optional[str] = None,
     seed: Optional[int] = None,
 ) -> None:
-    App(human_color, ai_iterations, seed).run()
+    App(human_color, ai_iterations, ai_engine, model_path, seed).run()
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="9x9 Go vs MCTS AI")
+    p = argparse.ArgumentParser(description="9x9 Go vs MCTS/PUCT AI")
     p.add_argument("--human-color", choices=["black", "white"], default="black")
     p.add_argument("--ai-iterations", type=int, default=400)
+    p.add_argument("--engine", choices=["mcts", "puct"], default="mcts")
+    p.add_argument("--model-path", type=str, default=None)
     p.add_argument("--seed", type=int, default=None)
     args = p.parse_args()
     color = BLACK if args.human_color == "black" else WHITE
-    run_app(human_color=color, ai_iterations=args.ai_iterations, seed=args.seed)
+    run_app(
+        human_color=color,
+        ai_iterations=args.ai_iterations,
+        ai_engine=args.engine,
+        model_path=args.model_path,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":
