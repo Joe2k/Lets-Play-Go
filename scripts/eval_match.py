@@ -5,6 +5,10 @@ Runs multiple games between two agents (alternating colors) and reports:
 - average score margin
 - move latency statistics
 
+All runs append per-game rows to eval_results.csv (overridable via --csv).
+Each row records both sides' engine, iterations, and model path so multiple
+runs against different checkpoints can be sliced apart later.
+
 Use --a-engine / --b-engine to mix MCTS and PUCT, e.g.:
 
     # PUCT(net_new) vs PUCT(net_old) — promotion gate.
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import pathlib
 import statistics
 import sys
@@ -35,6 +40,29 @@ if str(ROOT) not in sys.path:
 
 from ai.agent import MCTSAgent
 from engine.go_engine import BLACK, WHITE, GoGame
+
+DEFAULT_CSV = "eval_results.csv"
+CSV_COLUMNS = [
+    "timestamp",
+    "match_id",
+    "game_index",
+    "black_name",
+    "white_name",
+    "winner_name",
+    "black_engine",
+    "white_engine",
+    "black_iters",
+    "white_iters",
+    "black_model",
+    "white_model",
+    "black_score",
+    "white_score",
+    "margin_for_black",
+    "moves",
+    "finished",
+    "black_avg_ms",
+    "white_avg_ms",
+]
 
 
 @dataclass
@@ -58,8 +86,8 @@ def _build_agent(spec: AgentSpec, seed: int):
 
 @dataclass
 class GameResult:
-    black_name: str
-    white_name: str
+    black_spec: AgentSpec
+    white_spec: AgentSpec
     winner_name: str
     black_score: float
     white_score: float
@@ -108,8 +136,8 @@ def _play_one_game(
     s = game.score()
     winner_name = black_spec.name if s["winner"] == BLACK else white_spec.name
     return GameResult(
-        black_name=black_spec.name,
-        white_name=white_spec.name,
+        black_spec=black_spec,
+        white_spec=white_spec,
         winner_name=winner_name,
         black_score=s["black"],
         white_score=s["white"],
@@ -121,31 +149,52 @@ def _play_one_game(
     )
 
 
-def _append_csv(csv_path: pathlib.Path, rows: list[GameResult]) -> None:
-    write_header = not csv_path.exists()
+def _check_csv_schema(csv_path: pathlib.Path) -> None:
+    """Refuse to append to an existing CSV with a different header."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return
+    with csv_path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return
+    if header != CSV_COLUMNS:
+        raise SystemExit(
+            f"\nrefusing to append: {csv_path} has a different schema.\n"
+            f"  existing header: {header}\n"
+            f"  expected header: {CSV_COLUMNS}\n"
+            f"  fix: delete the file (or pass --csv <new_path>) and re-run."
+        )
+
+
+def _append_csv(
+    csv_path: pathlib.Path,
+    rows: list[GameResult],
+    timestamp: str,
+    match_id: str,
+    start_index: int = 0,
+) -> None:
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
     with csv_path.open("a", newline="") as f:
         w = csv.writer(f)
         if write_header:
+            w.writerow(CSV_COLUMNS)
+        for offset, r in enumerate(rows):
             w.writerow(
                 [
-                    "black_name",
-                    "white_name",
-                    "winner_name",
-                    "black_score",
-                    "white_score",
-                    "margin_for_black",
-                    "moves",
-                    "finished",
-                    "black_avg_ms",
-                    "white_avg_ms",
-                ]
-            )
-        for r in rows:
-            w.writerow(
-                [
-                    r.black_name,
-                    r.white_name,
+                    timestamp,
+                    match_id,
+                    start_index + offset,
+                    r.black_spec.name,
+                    r.white_spec.name,
                     r.winner_name,
+                    r.black_spec.engine,
+                    r.white_spec.engine,
+                    r.black_spec.iterations,
+                    r.white_spec.iterations,
+                    r.black_spec.model_path or "",
+                    r.white_spec.model_path or "",
                     f"{r.black_score:.2f}",
                     f"{r.white_score:.2f}",
                     f"{r.margin_for_black:.2f}",
@@ -170,7 +219,8 @@ def main() -> None:
     p.add_argument("--b-engine", choices=["mcts", "puct"], default="mcts")
     p.add_argument("--a-model", type=str, default=None)
     p.add_argument("--b-model", type=str, default=None)
-    p.add_argument("--csv", default=None)
+    p.add_argument("--csv", default=DEFAULT_CSV,
+                   help=f"CSV output path (default: {DEFAULT_CSV}). Pass empty string to disable.")
     p.add_argument("--gate-threshold", type=float, default=None,
                    help="If set, exit code 0 only when A's win rate >= this value (e.g. 0.55).")
     args = p.parse_args()
@@ -179,48 +229,94 @@ def main() -> None:
                   engine=args.a_engine, model_path=args.a_model)
     b = AgentSpec(name=args.b_name, iterations=args.b_iters,
                   engine=args.b_engine, model_path=args.b_model)
-    results: list[GameResult] = []
 
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    match_id = f"{a.name}_vs_{b.name}_{timestamp}"
+
+    csv_path: Optional[pathlib.Path] = None
+    if args.csv:
+        csv_path = pathlib.Path(args.csv)
+        # Touch parent dir if user passed something like out/eval.csv.
+        if csv_path.parent and not csv_path.parent.exists():
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+        _check_csv_schema(csv_path)
+
+    print(f"match: {match_id}")
+    print(f"  {a.name}: engine={a.engine} iters={a.iterations} model={a.model_path or '-'}")
+    print(f"  {b.name}: engine={b.engine} iters={b.iterations} model={b.model_path or '-'}")
+    print(f"  csv: {csv_path or '(disabled)'}")
+
+    results: list[GameResult] = []
     started = time.perf_counter()
-    for i in range(args.games):
-        if i % 2 == 0:
-            black_spec, white_spec = a, b
-        else:
-            black_spec, white_spec = b, a
-        results.append(
-            _play_one_game(
+    a_wins_running = 0
+    b_wins_running = 0
+
+    try:
+        for i in range(args.games):
+            if i % 2 == 0:
+                black_spec, white_spec = a, b
+            else:
+                black_spec, white_spec = b, a
+
+            game_started = time.perf_counter()
+            result = _play_one_game(
                 black_spec=black_spec,
                 white_spec=white_spec,
                 seed=args.seed + 1009 * i,
                 max_moves=args.max_moves,
             )
-        )
+            game_dt = time.perf_counter() - game_started
+            results.append(result)
+
+            if result.winner_name == a.name:
+                a_wins_running += 1
+            else:
+                b_wins_running += 1
+
+            played = i + 1
+            wr = a_wins_running / played * 100.0
+            print(
+                f"  [{played}/{args.games}] {result.black_spec.name}(B) vs {result.white_spec.name}(W) "
+                f"-> {result.winner_name} | score {result.black_score:.1f}-{result.white_score:.1f} "
+                f"| {result.moves} moves | {game_dt:.1f}s | "
+                f"{a.name}={a_wins_running} {b.name}={b_wins_running} ({wr:.1f}%)"
+            )
+
+            if csv_path is not None:
+                _append_csv(csv_path, [result], timestamp, match_id, start_index=i)
+    except KeyboardInterrupt:
+        print("\nInterrupted; reporting on completed games.")
+
     elapsed = time.perf_counter() - started
+    if not results:
+        print("No games completed.")
+        sys.exit(1 if args.gate_threshold is not None else 0)
 
     a_wins = sum(1 for r in results if r.winner_name == a.name)
     b_wins = len(results) - a_wins
-    a_winrate = a_wins / len(results) if results else 0.0
-    avg_moves = statistics.mean(r.moves for r in results) if results else 0.0
-    avg_margin_for_black = statistics.mean(r.margin_for_black for r in results) if results else 0.0
+    a_winrate = a_wins / len(results)
+    avg_moves = statistics.mean(r.moves for r in results)
+    avg_margin_for_black = statistics.mean(r.margin_for_black for r in results)
 
     margins_for_a: list[float] = []
     for r in results:
-        if r.black_name == a.name:
+        if r.black_spec.name == a.name:
             margins_for_a.append(r.margin_for_black)
         else:
             margins_for_a.append(-r.margin_for_black)
-    avg_margin_for_a = statistics.mean(margins_for_a) if margins_for_a else 0.0
+    avg_margin_for_a = statistics.mean(margins_for_a)
 
     a_move_latencies: list[float] = []
     b_move_latencies: list[float] = []
     for r in results:
-        if r.black_name == a.name:
+        if r.black_spec.name == a.name:
             a_move_latencies.append(r.black_avg_ms)
             b_move_latencies.append(r.white_avg_ms)
         else:
             a_move_latencies.append(r.white_avg_ms)
             b_move_latencies.append(r.black_avg_ms)
 
+    print()
     print(f"Games: {len(results)} in {elapsed:.2f}s")
     print(f"{a.name} ({a.engine}, iters={a.iterations}) wins: {a_wins} ({a_winrate*100:.1f}%)")
     print(f"{b.name} ({b.engine}, iters={b.iterations}) wins: {b_wins} ({(1-a_winrate)*100:.1f}%)")
@@ -230,10 +326,8 @@ def main() -> None:
     print(f"{a.name} avg move latency: {statistics.mean(a_move_latencies):.2f} ms")
     print(f"{b.name} avg move latency: {statistics.mean(b_move_latencies):.2f} ms")
 
-    if args.csv:
-        csv_path = pathlib.Path(args.csv)
-        _append_csv(csv_path, results)
-        print(f"Saved per-game results to {csv_path}")
+    if csv_path is not None:
+        print(f"Per-game rows appended to {csv_path}")
 
     if args.gate_threshold is not None:
         passed = a_winrate >= args.gate_threshold
