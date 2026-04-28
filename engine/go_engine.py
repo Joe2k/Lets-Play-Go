@@ -9,7 +9,7 @@ Rule order inside place_stone matters:
 
 from __future__ import annotations
 
-import copy
+from dataclasses import dataclass
 from collections import deque
 from typing import Optional
 
@@ -25,6 +25,13 @@ def _other(color: int) -> int:
     return WHITE if color == BLACK else BLACK
 
 
+@dataclass
+class _GroupCache:
+    color: int
+    stones: set[int]
+    liberties: set[int]
+
+
 class GoGame:
     def __init__(self) -> None:
         self.new_game()
@@ -37,6 +44,33 @@ class GoGame:
         self.last_move: object = None
         self.finished: bool = False
         self.loser: Optional[int] = None
+        self._gid_by_idx: list[int] = [-1] * (SIZE * SIZE)
+        self._groups: dict[int, _GroupCache] = {}
+        self._next_gid: int = 0
+        self._groups_dirty: bool = False
+
+    def clone_fast(self) -> "GoGame":
+        """Cheap clone for MCTS hot paths.
+
+        Equivalent to deepcopy for current fields, but avoids generic object
+        traversal overhead.
+        """
+        g = GoGame.__new__(GoGame)
+        g.board = self.board.copy()
+        g.to_move = self.to_move
+        g.prev_position = self.prev_position
+        g.captures = self.captures.copy()
+        g.last_move = self.last_move
+        g.finished = self.finished
+        g.loser = self.loser
+        g._gid_by_idx = self._gid_by_idx.copy()
+        g._groups = {
+            gid: _GroupCache(gr.color, gr.stones.copy(), gr.liberties.copy())
+            for gid, gr in self._groups.items()
+        }
+        g._next_gid = self._next_gid
+        g._groups_dirty = self._groups_dirty
+        return g
 
     # ---------- public API ----------
 
@@ -48,31 +82,72 @@ class GoGame:
         if self.board[row * SIZE + col] != EMPTY:
             return False
 
+        self._ensure_groups()
         pre_move = tuple(self.board)
         me = self.to_move
         opp = _other(me)
         i = row * SIZE + col
         self.board[i] = me
+        friendly_gids: set[int] = set()
+        enemy_gids: set[int] = set()
+        liberties: set[int] = set()
+        for nidx in self._neighbors_of(i):
+            v = self.board[nidx]
+            if v == EMPTY:
+                liberties.add(nidx)
+                continue
+            gid = self._gid_by_idx[nidx]
+            if gid == -1:
+                continue
+            if v == me:
+                friendly_gids.add(gid)
+            elif v == opp:
+                enemy_gids.add(gid)
+
+        new_gid = self._next_gid
+        self._next_gid += 1
+        self._groups[new_gid] = _GroupCache(color=me, stones={i}, liberties=liberties)
+        self._gid_by_idx[i] = new_gid
+
+        for gid in tuple(friendly_gids):
+            if gid not in self._groups:
+                continue
+            grp = self._groups[gid]
+            self._groups[new_gid].stones.update(grp.stones)
+            self._groups[new_gid].liberties.update(grp.liberties)
+            for sidx in grp.stones:
+                self._gid_by_idx[sidx] = new_gid
+            del self._groups[gid]
+        self._groups[new_gid].liberties.discard(i)
+
+        for gid in enemy_gids:
+            if gid in self._groups:
+                self._groups[gid].liberties.discard(i)
 
         captured = 0
-        for dr, dc in _NEIGHBOR_OFFSETS:
-            nr, nc = row + dr, col + dc
-            if not (0 <= nr < SIZE and 0 <= nc < SIZE):
-                continue
-            if self.board[nr * SIZE + nc] != opp:
-                continue
-            stones, liberties = self._group(nr, nc)
-            if not liberties:
-                self._remove(stones)
-                captured += len(stones)
+        dead_enemy = [gid for gid in enemy_gids if gid in self._groups and not self._groups[gid].liberties]
+        for gid in dead_enemy:
+            grp = self._groups[gid]
+            captured += len(grp.stones)
+            for sidx in grp.stones:
+                self.board[sidx] = EMPTY
+                self._gid_by_idx[sidx] = -1
+                for nidx in self._neighbors_of(sidx):
+                    ngid = self._gid_by_idx[nidx]
+                    if ngid != -1 and ngid in self._groups:
+                        self._groups[ngid].liberties.add(sidx)
+            del self._groups[gid]
 
-        own_stones, own_liberties = self._group(row, col)
-        if not own_liberties:
+        if not self._groups[new_gid].liberties:
             self.board = list(pre_move)
+            self._groups_dirty = True
+            self._ensure_groups()
             return False
 
         if tuple(self.board) == self.prev_position:
             self.board = list(pre_move)
+            self._groups_dirty = True
+            self._ensure_groups()
             return False
 
         self.prev_position = pre_move
@@ -88,7 +163,7 @@ class GoGame:
             return False
         if self.board[row * SIZE + col] != EMPTY:
             return False
-        probe = copy.deepcopy(self)
+        probe = self.clone_fast()
         return probe.place_stone(row, col)
 
     def get_board(self) -> list[list[int]]:
@@ -154,6 +229,7 @@ class GoGame:
 
         g = cls()
         g.board = [board[r][c] for r in range(SIZE) for c in range(SIZE)]
+        g._groups_dirty = True
         g.to_move = to_move
         if prev_position is not None:
             if len(prev_position) != SIZE or any(len(row) != SIZE for row in prev_position):
@@ -163,35 +239,83 @@ class GoGame:
             )
         if captures is not None:
             g.captures = {BLACK: int(captures.get(BLACK, 0)), WHITE: int(captures.get(WHITE, 0))}
+        g._ensure_groups()
         return g
 
     # ---------- private helpers ----------
 
     def _group(self, row: int, col: int) -> tuple[set, set]:
+        self._ensure_groups()
         color = self.board[row * SIZE + col]
         stones: set[tuple[int, int]] = set()
         liberties: set[tuple[int, int]] = set()
         if color == EMPTY:
             return stones, liberties
-        queue = deque([(row, col)])
-        stones.add((row, col))
-        while queue:
-            r, c = queue.popleft()
-            for dr, dc in _NEIGHBOR_OFFSETS:
-                nr, nc = r + dr, c + dc
-                if not (0 <= nr < SIZE and 0 <= nc < SIZE):
-                    continue
-                v = self.board[nr * SIZE + nc]
-                if v == EMPTY:
-                    liberties.add((nr, nc))
-                elif v == color and (nr, nc) not in stones:
-                    stones.add((nr, nc))
-                    queue.append((nr, nc))
+        gid = self._gid_by_idx[row * SIZE + col]
+        if gid == -1:
+            return stones, liberties
+        gr = self._groups[gid]
+        stones = {divmod(idx, SIZE) for idx in gr.stones}
+        liberties = {divmod(idx, SIZE) for idx in gr.liberties}
         return stones, liberties
 
     def _remove(self, stones: set) -> None:
         for r, c in stones:
             self.board[r * SIZE + c] = EMPTY
+        self._groups_dirty = True
+
+    def _neighbors_of(self, idx: int) -> list[int]:
+        r, c = divmod(idx, SIZE)
+        out: list[int] = []
+        for dr, dc in _NEIGHBOR_OFFSETS:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < SIZE and 0 <= nc < SIZE:
+                out.append(nr * SIZE + nc)
+        return out
+
+    def _ensure_groups(self) -> None:
+        if not self._groups_dirty:
+            return
+        self._rebuild_groups()
+
+    def _rebuild_groups(self) -> None:
+        self._gid_by_idx = [-1] * (SIZE * SIZE)
+        self._groups = {}
+        self._next_gid = 0
+        visited = [False] * (SIZE * SIZE)
+
+        for start in range(SIZE * SIZE):
+            color = self.board[start]
+            if color == EMPTY or visited[start]:
+                continue
+
+            gid = self._next_gid
+            self._next_gid += 1
+            stones: set[int] = set()
+            liberties: set[int] = set()
+            queue = deque([start])
+            visited[start] = True
+
+            while queue:
+                idx = queue.popleft()
+                stones.add(idx)
+                self._gid_by_idx[idx] = gid
+                r, c = divmod(idx, SIZE)
+                for dr, dc in _NEIGHBOR_OFFSETS:
+                    nr, nc = r + dr, c + dc
+                    if not (0 <= nr < SIZE and 0 <= nc < SIZE):
+                        continue
+                    nidx = nr * SIZE + nc
+                    v = self.board[nidx]
+                    if v == EMPTY:
+                        liberties.add(nidx)
+                    elif v == color and not visited[nidx]:
+                        visited[nidx] = True
+                        queue.append(nidx)
+
+            self._groups[gid] = _GroupCache(color=color, stones=stones, liberties=liberties)
+
+        self._groups_dirty = False
 
     def _territory(self) -> tuple[int, int]:
         """Chinese area-scoring territory: empty regions bordered by only one color."""
