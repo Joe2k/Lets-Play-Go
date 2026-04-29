@@ -125,15 +125,65 @@ def _move_priority(game: GoGame, move: tuple[int, int]) -> int:
     return priority
 
 
+def _own_territory_indices(board: list[int], color: int) -> set[int]:
+    """Flat indices of empty squares lying in regions bordered only by `color`.
+
+    Mirrors GoGame._territory's Chinese-area-scoring definition: an empty
+    region that touches only `color` stones (and never the opponent) belongs
+    to that color. Filling those points adds no area-score and just wastes a
+    tempo, so candidate_moves excludes them. This is a strict superset of
+    the single-point own-eye check.
+    """
+    visited = [False] * (SIZE * SIZE)
+    out: set[int] = set()
+    for start in range(SIZE * SIZE):
+        if visited[start] or board[start] != EMPTY:
+            continue
+        region: list[int] = []
+        borders: set[int] = set()
+        stack = [start]
+        visited[start] = True
+        while stack:
+            idx = stack.pop()
+            region.append(idx)
+            r, c = divmod(idx, SIZE)
+            for dr, dc in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < SIZE and 0 <= nc < SIZE):
+                    continue
+                nidx = nr * SIZE + nc
+                v = board[nidx]
+                if v == EMPTY:
+                    if not visited[nidx]:
+                        visited[nidx] = True
+                        stack.append(nidx)
+                else:
+                    borders.add(v)
+        if borders == {color}:
+            out.update(region)
+    return out
+
+
 def candidate_moves(game: GoGame) -> list[tuple[int, int]]:
-    """Empty points that aren't own-eyes. May include suicide/ko moves;
-    those are filtered downstream by place_stone returning False."""
+    """Empty points that aren't own-eyes or inside own territory.
+
+    Excluding own territory keeps the bot from wasting moves filling its
+    own area: those squares are already counted under Chinese scoring, and
+    by definition own-territory regions have no enemy contact, so no
+    capture or escape can come from playing inside one. Suicide/ko moves
+    may still slip through and are filtered downstream by place_stone
+    returning False.
+    """
     color = game.to_move
     board = game.board
+    own_territory = _own_territory_indices(board, color)
     out: list[tuple[int, int]] = []
     for r in range(SIZE):
         for c in range(SIZE):
-            if board[r * SIZE + c] != EMPTY:
+            idx = r * SIZE + c
+            if board[idx] != EMPTY:
+                continue
+            if idx in own_territory:
                 continue
             if _is_own_eye(board, r, c, color):
                 continue
