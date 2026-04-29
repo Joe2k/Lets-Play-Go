@@ -7,7 +7,7 @@ Board conventions used throughout:
 - `9x9` board, `B` = Black, `W` = White, `.` = empty
 - Coordinates are `(row, col)`, `0`-indexed from the top-left
 - `KOMI = 2.5` (awarded to White under Chinese area scoring)
-- Passing = conceding the game (spec choice, not standard two-pass Go)
+- Passing follows standard Go: two consecutive passes end the game and territory is scored. `concede()` exists separately for immediate resignation.
 
 ---
 
@@ -222,15 +222,30 @@ B W . W . . . . .
 
 ---
 
-## 14. `test_pass_ends_game_passer_loses`
+## 14a. `test_two_passes_end_game`
 
-**Rule (spec-specific):** Passing ends the game immediately. The passer loses regardless of territory count.
+**Rule:** Two consecutive `pass_turn()` calls end the game. The final position is scored normally (territory + komi).
 
 | Step | Input | Expected |
 |---|---|---|
 | 1 | Black `place_stone(4, 4)` | `True`, `to_move == WHITE` |
-| 2 | White `pass_turn()` | `finished is True`, `loser == WHITE` |
+| 2 | White `pass_turn()` | `finished is False`, `to_move == BLACK` |
+| 3 | Black `pass_turn()` | `finished is True` |
+| 4 | `score()` | `black == 81` (1 stone + 80 territory), `white == 2.5` (komi only), `winner == BLACK` |
+
+## 14b. `test_concede_ends_game_immediately`
+
+**Rule:** `concede()` ends the game immediately and the conceder loses, regardless of board position.
+
+| Step | Input | Expected |
+|---|---|---|
+| 1 | Black `place_stone(4, 4)` | `True`, `to_move == WHITE` |
+| 2 | White `concede()` | `finished is True`, `loser == WHITE` |
 | 3 | `score()` | `winner == BLACK` |
+
+## 14c. `test_history_records_moves_passes_and_concede`
+
+**Rule:** `GoGame.history` appends every action in order — stone placements as `(row, col)`, passes as `"pass"`, concessions as `"concede"`. External-engine adapters (`GnuGoAgent`) replay this list to sync state.
 
 ---
 

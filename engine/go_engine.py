@@ -42,6 +42,7 @@ class GoGame:
         self.prev_position: Optional[tuple[int, ...]] = None
         self.captures: dict[int, int] = {BLACK: 0, WHITE: 0}
         self.last_move: object = None
+        self.history: list[tuple[int, int] | str] = []
         self.finished: bool = False
         self.loser: Optional[int] = None
         self._gid_by_idx: list[int] = [-1] * (SIZE * SIZE)
@@ -61,6 +62,7 @@ class GoGame:
         g.prev_position = self.prev_position
         g.captures = self.captures.copy()
         g.last_move = self.last_move
+        g.history = self.history.copy()
         g.finished = self.finished
         g.loser = self.loser
         g._gid_by_idx = self._gid_by_idx.copy()
@@ -153,6 +155,7 @@ class GoGame:
         self.prev_position = pre_move
         self.captures[me] += captured
         self.last_move = (row, col)
+        self.history.append((row, col))
         self.to_move = opp
         return True
 
@@ -170,11 +173,24 @@ class GoGame:
         return [list(self.board[r * SIZE:(r + 1) * SIZE]) for r in range(SIZE)]
 
     def pass_turn(self) -> None:
+        """The current player passes. Two consecutive passes ends the game.
+        This allows GNU Go to finish naturally and be scored correctly."""
+        if self.finished:
+            return
+        if self.last_move == "pass":
+            self.finished = True
+        self.last_move = "pass"
+        self.history.append("pass")
+        self.to_move = _other(self.to_move)
+
+    def concede(self) -> None:
+        """Immediate concession (the old behavior of pass_turn)."""
         if self.finished:
             return
         self.finished = True
         self.loser = self.to_move
-        self.last_move = "pass"
+        self.last_move = "concede"
+        self.history.append("concede")
 
     def end_game(self) -> None:
         self.pass_turn()

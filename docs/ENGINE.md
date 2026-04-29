@@ -122,23 +122,43 @@ Fast-path checks (game finished, out of bounds, cell not empty) happen before th
 
 ## `GoGame.pass_turn()`
 
-**What it does:** the current player concedes. The game ends immediately and they lose.
+**What it does:** the current player passes their turn. Two consecutive passes end the game; scoring then runs from the final board position. This matches standard Go and lets external engines (e.g. GNU Go via GTP) finish naturally.
+
+| Field after call | Value |
+|---|---|
+| `to_move` | flipped to the opponent |
+| `last_move` | `"pass"` |
+| `finished` | `True` only if the previous move was also `"pass"` |
+
+Calling `pass_turn()` on an already-finished game is a no-op.
+
+**Tie-breaking on score:** with two passes, `loser` is `None` and `score()` decides the winner from territory + komi.
+
+---
+
+## `GoGame.concede()`
+
+**What it does:** the current player resigns. The game ends immediately and they lose, regardless of board position.
 
 | Field after call | Value |
 |---|---|
 | `finished` | `True` |
 | `loser` | whoever was `to_move` |
-| `last_move` | `"pass"` |
+| `last_move` | `"concede"` |
 
-Calling `pass_turn()` on an already-finished game is a no-op.
-
-**Why "passer loses" instead of normal Go:** that's the spec for this assignment. Real Go uses two consecutive passes and then scores; here, a single pass = concession.
+Use this for "I give up" UX (e.g. the GUI's pass-to-forfeit button under the original spec). Use `pass_turn()` for actual passing during play.
 
 ---
 
 ## `GoGame.end_game()`
 
 **What it does:** alias for `pass_turn()`. Exists because the spec lists `end_game` as part of the required public API.
+
+---
+
+## `GoGame.history`
+
+A `list[tuple[int, int] | str]` recording every move played in order. Stone placements are stored as `(row, col)`; passes as `"pass"`; concessions as `"concede"`. Used by external-engine adapters (`GnuGoAgent`) that need to replay the game state via GTP.
 
 ---
 
@@ -151,7 +171,7 @@ Calling `pass_turn()` on an already-finished game is a no-op.
 - **Black points** = Black stones on the board + empty regions that border only Black
 - **White points** = White stones on the board + empty regions that border only White + `KOMI` (2.5)
 - **Dame** (empty regions touching both colors, or touching no stones at all) count for nobody
-- **Winner**: if someone conceded via `pass_turn`, the opponent wins automatically. Otherwise whoever has more points wins. (Ties go to White because of komi, and the current implementation breaks ties toward White as well.)
+- **Winner**: if someone conceded via `concede()`, the opponent wins automatically. Otherwise whoever has more points wins. (Ties go to White because of komi, and the current implementation breaks ties toward White as well.)
 
 ### Return dict
 
@@ -242,4 +262,4 @@ For each empty point not yet visited:
 - **One source of truth.** Every legality question routes through `place_stone`. `is_legal` is just a deepcopy probe. No duplicated rule code means rules can't drift.
 - **Flat board + snapshot undo.** Storing the board as a flat list lets us `tuple(self.board)` cheaply for the ko check, and `self.board = list(pre_move)` is a one-line undo.
 - **Capture-first rule ordering.** Captures resolve before the mover's own-liberty check, which handles snapback correctly without any special-case code.
-- **Chinese area scoring fits in ~25 lines.** Stones + single-color-bordered empty regions + komi. No dead-stone marking needed because the spec uses pass-to-concede.
+- **Chinese area scoring fits in ~25 lines.** Stones + single-color-bordered empty regions + komi. No dead-stone marking needed: external engines play the game out to two passes, and a separate `concede()` exists for "I give up" UX.

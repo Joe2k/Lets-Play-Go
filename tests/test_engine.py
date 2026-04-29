@@ -190,15 +190,50 @@ def test_occupied_rejected():
     assert g.to_move == WHITE
 
 
-def test_pass_ends_game_passer_loses():
+def test_two_passes_end_game():
     g = GoGame()
     g.place_stone(4, 4)  # Black
     assert g.to_move == WHITE
-    g.pass_turn()  # White concedes
+    g.pass_turn()  # White passes
+    assert g.finished is False
+    assert g.to_move == BLACK
+    g.pass_turn()  # Black passes
+    assert g.finished is True
+    # Board has 1 black stone and 80 empty cells touching only black.
+    # Score: Black = 1 stone + 80 territory = 81.
+    # White = 0 stones + 0 territory + 2.5 komi = 2.5.
+    result = g.score()
+    assert result["black"] == 81
+    assert result["white"] == 2.5
+    assert result["winner"] == BLACK
+
+
+def test_concede_ends_game_immediately():
+    g = GoGame()
+    g.place_stone(4, 4)  # Black
+    assert g.to_move == WHITE
+    g.concede()  # White concedes
     assert g.finished is True
     assert g.loser == WHITE
     result = g.score()
     assert result["winner"] == BLACK
+
+
+def test_history_records_moves_passes_and_concede():
+    g = GoGame()
+    g.place_stone(4, 4)
+    g.place_stone(3, 3)
+    g.pass_turn()
+    g.place_stone(5, 5)
+    assert g.history == [(4, 4), (3, 3), "pass", (5, 5)]
+    # clone_fast preserves history.
+    g2 = g.clone_fast()
+    assert g2.history == g.history
+    # concede is recorded too.
+    g3 = GoGame()
+    g3.place_stone(0, 0)
+    g3.concede()
+    assert g3.history == [(0, 0), "concede"]
 
 
 def test_score_empty_board():
