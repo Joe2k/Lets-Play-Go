@@ -60,12 +60,17 @@ def _select_child(node: PUCTNode, c_puct: float) -> tuple[tuple[int, int], PUCTN
 
 
 def _expand_node(node: PUCTNode, game: GoGame, predictor: Predictor) -> float:
+    probs, value = predictor.predict(game)
+    _expand_node_from_data(node, game, probs)
+    return value
+
+
+def _expand_node_from_data(node: PUCTNode, game: GoGame, probs: list[float]) -> None:
     legal_moves = candidate_moves(game)
     if not legal_moves:
-        # Forced pass = forced loss for the side to move under this project's rules.
-        return -1.0
+        node.expanded = True
+        return
 
-    probs, value = predictor.predict(game)
     priors: list[tuple[tuple[int, int], float]] = []
     total = 0.0
     for r, c in legal_moves:
@@ -80,7 +85,6 @@ def _expand_node(node: PUCTNode, game: GoGame, predictor: Predictor) -> float:
         for move, p in priors
     }
     node.expanded = True
-    return value
 
 
 def _add_dirichlet_noise(node: PUCTNode, rng: random.Random) -> None:
@@ -124,13 +128,9 @@ def run_puct_search(
         path = [node]
 
         # Selection: descend while the current node has expanded children.
-        # Depth-capped so a single iteration's work stays bounded even when
-        # tree reuse has produced a deep persisted subtree.
         while node.expanded and node.children and len(path) <= max_descent_depth:
             move, child = _select_child(node, c_puct=c_puct)
             if not sim.place_stone(*move):
-                # Illegal child (suicide/ko slipped through). Drop it and
-                # try the next-best child from this same node.
                 del node.children[move]
                 if not node.children:
                     break
@@ -138,20 +138,18 @@ def run_puct_search(
             node = child
             path.append(node)
 
-        # Evaluate leaf — leaf_value is from the leaf's to_play perspective.
+        # Evaluate leaf
         if sim.finished:
             winner = sim.score()["winner"]
             leaf_value = 1.0 if winner == node.to_play else -1.0
         elif not node.expanded:
             leaf_value = _expand_node(node, sim, predictor)
         elif not node.children:
-            # All children were pruned as illegal — forced loss for side to move.
             leaf_value = -1.0
         else:
-            # Hit depth cap mid-descent on an already-expanded node.
             leaf_value = 0.0
 
-        # Backprop: each node stores value_sum from its OWN perspective.
+        # Backprop
         v = leaf_value
         for p in reversed(path):
             p.visit_count += 1
@@ -159,6 +157,83 @@ def run_puct_search(
             v = -v
 
     return root
+
+
+def run_batched_puct_search(
+    games: list[GoGame],
+    model: PolicyValueModel,
+    iterations: int,
+    c_puct: float,
+    roots: list[PUCTNode],
+    add_root_noise: bool = False,
+    rng: Optional[random.Random] = None,
+    max_descent_depth: int = _MAX_DESCENT_DEPTH,
+) -> list[PUCTNode]:
+    """Run MCTS iterations for a batch of games in parallel, batching NN evaluations."""
+    # Ensure roots are initialized
+    for i, root in enumerate(roots):
+        if not root.expanded:
+            _expand_node(root, games[i], model)
+        if add_root_noise:
+            _add_dirichlet_noise(root, rng or random.Random())
+
+    for _ in range(iterations):
+        # 1. Selection & Descent
+        sims = [g.clone_fast() for g in games]
+        paths = [[r] for r in roots]
+        leaf_nodes: list[PUCTNode] = []
+
+        for i in range(len(games)):
+            sim = sims[i]
+            node = roots[i]
+            path = paths[i]
+
+            while node.expanded and node.children and len(path) <= max_descent_depth:
+                move, child = _select_child(node, c_puct=c_puct)
+                if not sim.place_stone(*move):
+                    del node.children[move]
+                    if not node.children:
+                        break
+                    continue
+                node = child
+                path.append(node)
+            leaf_nodes.append(node)
+
+        # 2. Evaluation
+        to_predict_indices = []
+        to_predict_sims = []
+        leaf_values = [0.0] * len(games)
+
+        for i, (node, sim) in enumerate(zip(leaf_nodes, sims)):
+            if sim.finished:
+                winner = sim.score()["winner"]
+                leaf_values[i] = 1.0 if winner == node.to_play else -1.0
+            elif not node.expanded:
+                to_predict_indices.append(i)
+                to_predict_sims.append(sim)
+            elif not node.children:
+                leaf_values[i] = -1.0
+            else:
+                leaf_values[i] = 0.0
+
+        # Batch Prediction
+        if to_predict_sims:
+            probs_list, values = model.predict_batch(to_predict_sims)
+            for i, idx in enumerate(to_predict_indices):
+                node = leaf_nodes[idx]
+                sim = to_predict_sims[i]
+                _expand_node_from_data(node, sim, probs_list[i])
+                leaf_values[idx] = values[i]
+
+        # 3. Backpropagation
+        for i in range(len(games)):
+            v = leaf_values[i]
+            for p in reversed(paths[i]):
+                p.visit_count += 1
+                p.value_sum += v
+                v = -v
+
+    return roots
 
 
 class PUCTAgent:

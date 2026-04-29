@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ai.model import PolicyValueModel, encode_game_tensor, require_torch, torch
-from ai.puct_agent import PUCTNode, run_puct_search
+from ai.puct_agent import PUCTNode, run_puct_search, run_batched_puct_search
 from engine.go_engine import GoGame
 
 
@@ -47,89 +47,158 @@ _worker_predictor = None
 
 def _init_worker(checkpoint_path: Optional[str], device: str) -> None:
     global _worker_predictor
-    torch.set_num_threads(1)
     if checkpoint_path:
         _worker_predictor = PolicyValueModel(model_path=checkpoint_path, device=device)
     else:
         _worker_predictor = _UniformPredictor()
 
 
-def _play_one_game(
-    game_idx: int,
-    seed: int,
+def _play_batch_games(
+    start_game_idx: int,
+    num_games: int,
+    batch_size: int,
+    seed_base: int,
     max_moves: int,
     iterations: int,
     temperature: float,
     add_root_noise: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Runs a single self-play game and returns (states, policy, value, move_count, winner)."""
-    rng = random.Random(seed)
-    game = GoGame()
+    progress_queue: Optional[mp.Queue] = None,
+    predictor: Optional[PolicyValueModel] = None,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
+    """Plays multiple games using batched MCTS and returns a list of game results."""
+    results = []
+    
+    active_games: list[GoGame] = []
+    active_roots: list[Optional[PUCTNode]] = []
+    active_seeds: list[int] = []
+    active_indices: list[int] = []
+    
+    game_states: list[list[torch.Tensor]] = []
+    game_policies: list[list[torch.Tensor]] = []
+    game_players: list[list[int]] = []
+    
+    next_idx_to_start = 0
+    
+    current_predictor = predictor or _worker_predictor
+    
+    def start_game():
+        nonlocal next_idx_to_start
+        if next_idx_to_start >= num_games:
+            return False
+        
+        g_idx = start_game_idx + next_idx_to_start
+        seed = seed_base + 10007 * g_idx
+        active_games.append(GoGame())
+        active_roots.append(None)
+        active_seeds.append(seed)
+        active_indices.append(g_idx)
+        
+        game_states.append([])
+        game_policies.append([])
+        game_players.append([])
+        
+        next_idx_to_start += 1
+        return True
 
-    states_list = []
-    policies_list = []
-    player_to_move_list = []
-    root: Optional[PUCTNode] = None
-
-    for ply in range(max_moves):
-        if game.finished:
-            break
-
-        root = run_puct_search(
-            game=game,
-            predictor=_worker_predictor,
-            iterations=iterations,
-            c_puct=1.4,
-            root=root,
-            add_root_noise=add_root_noise,
-            rng=rng,
-        )
-
-        if not root.children:
-            game.pass_turn()
-            break
-
-        visit_sum = sum(ch.visit_count for ch in root.children.values())
-        if visit_sum <= 0:
-            game.pass_turn()
-            break
-
-        pol = torch.zeros(81, dtype=torch.float32)
-        visits: dict[tuple[int, int], int] = {}
-        for move, ch in root.children.items():
-            v = ch.visit_count
-            visits[move] = v
-            pol[move[0] * 9 + move[1]] = float(v) / float(visit_sum)
-
-        st = encode_game_tensor(game)[0].cpu()
-        states_list.append(st)
-        policies_list.append(pol)
-        player_to_move_list.append(game.to_move)
-
-        temp = temperature if ply < 20 else max(0.05, temperature * 0.25)
-        mv = _sample_from_visits(visits, rng=rng, temperature=temp)
-
-        if not game.place_stone(*mv):
-            game.pass_turn()
-            break
-
-        if mv in root.children:
-            root = root.children[mv]
+    for _ in range(min(batch_size, num_games)):
+        start_game()
+        
+    plies_simulated = 0
+    while active_games:
+        plies_simulated += 1
+        if plies_simulated % 10 == 0 and progress_queue is None:
+            print(f"  [batch progress] simulating move {plies_simulated} for {len(active_games)} active games...", flush=True)
+            
+        roots_to_search = []
+        for i in range(len(active_games)):
+            if active_roots[i] is None:
+                active_roots[i] = PUCTNode(to_play=active_games[i].to_move, prior=1.0)
+            roots_to_search.append(active_roots[i])
+            
+        if isinstance(current_predictor, PolicyValueModel):
+            run_batched_puct_search(
+                games=active_games,
+                model=current_predictor,
+                iterations=iterations,
+                c_puct=1.4,
+                roots=roots_to_search,
+                add_root_noise=add_root_noise,
+                rng=random.Random(active_seeds[0] if active_seeds else 0),
+            )
         else:
-            root = None
-
-    winner = game.score()["winner"]
-    values_list = [1.0 if p == winner else -1.0 for p in player_to_move_list]
-
-    st_tensor = torch.stack(states_list) if states_list else torch.empty((0, 3, 9, 9), dtype=torch.float32)
-    pol_tensor = torch.stack(policies_list) if policies_list else torch.empty((0, 81), dtype=torch.float32)
-    val_tensor = torch.tensor(values_list, dtype=torch.float32) if values_list else torch.empty((0,), dtype=torch.float32)
-
-    return st_tensor, pol_tensor, val_tensor, len(player_to_move_list), winner
-
-
-def _play_one_game_wrapper(args_tuple):
-    return _play_one_game(*args_tuple)
+            for i in range(len(active_games)):
+                run_puct_search(
+                    game=active_games[i],
+                    predictor=current_predictor,
+                    iterations=iterations,
+                    c_puct=1.4,
+                    root=roots_to_search[i],
+                    add_root_noise=add_root_noise,
+                    rng=random.Random(active_seeds[i]),
+                )
+        
+        indices_to_remove = []
+        for i in range(len(active_games)):
+            game = active_games[i]
+            root = roots_to_search[i]
+            g_idx = active_indices[i]
+            
+            visit_sum = sum(ch.visit_count for ch in root.children.values())
+            if visit_sum <= 0 or not root.children or game.finished or len(game_states[i]) >= max_moves:
+                winner = game.score()["winner"]
+                p_list = game_players[i]
+                v_list = [1.0 if p == winner else -1.0 for p in p_list]
+                
+                st_tensor = torch.stack(game_states[i]) if game_states[i] else torch.empty((0, 3, 9, 9), dtype=torch.float32)
+                pol_tensor = torch.stack(game_policies[i]) if game_policies[i] else torch.empty((0, 81), dtype=torch.float32)
+                val_tensor = torch.tensor(v_list, dtype=torch.float32) if v_list else torch.empty((0,), dtype=torch.float32)
+                
+                res = (st_tensor, pol_tensor, val_tensor, len(p_list), winner, g_idx)
+                results.append(res)
+                if progress_queue is not None:
+                    progress_queue.put(res)
+                else:
+                    # In single-worker mode without a queue, print progress immediately
+                    print(f"  -> Game {g_idx} finished in {len(p_list)} moves (winner: {winner})", flush=True)
+                indices_to_remove.append(i)
+                continue
+                
+            pol = torch.zeros(81, dtype=torch.float32)
+            visits = {}
+            for move, ch in root.children.items():
+                v = ch.visit_count
+                visits[move] = v
+                pol[move[0] * 9 + move[1]] = float(v) / float(visit_sum)
+                
+            st = encode_game_tensor(game)[0].cpu()
+            game_states[i].append(st)
+            game_policies[i].append(pol)
+            game_players[i].append(game.to_move)
+            
+            rng = random.Random(active_seeds[i] + len(game_states[i]))
+            temp = temperature if len(game_states[i]) < 20 else max(0.05, temperature * 0.25)
+            mv = _sample_from_visits(visits, rng, temp)
+            
+            if not game.place_stone(*mv):
+                game.pass_turn()
+                active_roots[i] = None
+            else:
+                if mv in root.children:
+                    active_roots[i] = root.children[mv]
+                else:
+                    active_roots[i] = None
+                
+        for idx in reversed(indices_to_remove):
+            active_games.pop(idx)
+            active_roots.pop(idx)
+            active_seeds.pop(idx)
+            active_indices.pop(idx)
+            game_states.pop(idx)
+            game_policies.pop(idx)
+            game_players.pop(idx)
+            start_game()
+            
+    return results
 
 
 def main() -> None:
@@ -146,6 +215,7 @@ def main() -> None:
     p.add_argument("--no-noise", action="store_true")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=8)
     args = p.parse_args()
 
     out_path = pathlib.Path(args.output)
@@ -164,52 +234,101 @@ def main() -> None:
 
     started = time.perf_counter()
     games_completed = 0
-    task_args = [
-        (i, args.seed + 10007 * i, args.max_moves, args.iterations, args.temperature, not args.no_noise)
-        for i in range(args.games)
-    ]
-
-    print(f"Starting {args.workers} workers on {args.device}...", flush=True)
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    ctx = mp.get_context("spawn")
-    pool = ProcessPoolExecutor(
-        max_workers=args.workers,
-        mp_context=ctx,
-        initializer=_init_worker,
-        initargs=(args.predictor_checkpoint, args.device),
-    )
-    fut_to_idx = {pool.submit(_play_one_game, *t): t[0] for t in task_args}
-    skipped: list[int] = []
-    try:
-        for fut in as_completed(fut_to_idx):
-            idx = fut_to_idx[fut]
-            try:
-                st, pol, val, moves, winner = fut.result()
-            except Exception as e:
-                print(f"[game {idx}] FAILED: {type(e).__name__}: {e}", flush=True)
-                skipped.append(idx)
-                continue
+    
+    if args.workers == 1:
+        print(f"Starting 1 worker on {args.device} (batch_size={args.batch_size})...", flush=True)
+        predictor = None
+        if args.predictor_checkpoint:
+            predictor = PolicyValueModel(model_path=args.predictor_checkpoint, device=args.device)
+        else:
+            predictor = _UniformPredictor()
+            
+        # We can just run one big batch if it's 1 worker
+        results = _play_batch_games(
+            start_game_idx=0,
+            num_games=args.games,
+            batch_size=args.batch_size,
+            seed_base=args.seed,
+            max_moves=args.max_moves,
+            iterations=args.iterations,
+            temperature=args.temperature,
+            add_root_noise=not args.no_noise,
+            progress_queue=None,
+            predictor=predictor
+        )
+        for st, pol, val, moves, winner, g_idx in results:
             states.append(st)
             policies.append(pol)
             values.append(val)
             games_completed += 1
-
             elapsed = time.perf_counter() - started
-            eta = (args.games - games_completed) * (elapsed / games_completed) if games_completed > 0 else 0
-            print(f"[{games_completed}/{args.games}] game={idx} samples={moves:3d} | "
+            eta = (args.games - games_completed) * (elapsed / games_completed)
+            print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
                   f"winner={winner} | total={elapsed:6.1f}s | eta={eta:5.1f}s", flush=True)
-
             if args.save_every > 0 and games_completed % args.save_every == 0:
                 _flush("checkpoint")
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        _flush("interrupted")
-        pool.shutdown(wait=False, cancel_futures=True)
-        sys.exit(0)
+    else:
+        # Multi-worker mode
+        games_per_worker = args.games // args.workers
+        remainder = args.games % args.workers
+        worker_tasks = []
+        current_start = 0
+        for i in range(args.workers):
+            num = games_per_worker + (1 if i < remainder else 0)
+            if num > 0:
+                worker_tasks.append((
+                    current_start,
+                    num,
+                    args.batch_size,
+                    args.seed,
+                    args.max_moves,
+                    args.iterations,
+                    args.temperature,
+                    not args.no_noise
+                ))
+                current_start += num
 
-    pool.shutdown(wait=False, cancel_futures=True)
-    if skipped:
-        print(f"[done] skipped {len(skipped)} games: {sorted(skipped)}", flush=True)
+        print(f"Starting {args.workers} workers on {args.device} (batch_size={args.batch_size})...", flush=True)
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = mp.get_context("spawn")
+        manager = ctx.Manager()
+        progress_queue = manager.Queue()
+        
+        pool = ProcessPoolExecutor(
+            max_workers=args.workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(args.predictor_checkpoint, args.device),
+        )
+        
+        futs = [pool.submit(_play_batch_games, *t, progress_queue) for t in worker_tasks]
+        
+        try:
+            while games_completed < args.games:
+                try:
+                    res = progress_queue.get(timeout=1.0)
+                    st, pol, val, moves, winner, g_idx = res
+                    states.append(st)
+                    policies.append(pol)
+                    values.append(val)
+                    games_completed += 1
+                    elapsed = time.perf_counter() - started
+                    eta = (args.games - games_completed) * (elapsed / games_completed)
+                    print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
+                          f"winner={winner} | total={elapsed:6.1f}s | eta={eta:5.1f}s", flush=True)
+                    if args.save_every > 0 and games_completed % args.save_every == 0:
+                        _flush("checkpoint")
+                except:
+                    if all(f.done() for f in futs) and progress_queue.empty():
+                        break
+                    continue
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            _flush("interrupted")
+            pool.shutdown(wait=False, cancel_futures=True)
+            sys.exit(0)
+        pool.shutdown(wait=False, cancel_futures=True)
+
     _flush("done")
 
 

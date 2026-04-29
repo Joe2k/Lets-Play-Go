@@ -96,28 +96,33 @@ else:
 def encode_game_tensor(game: GoGame) -> torch.Tensor:
     """Return [1, 3, 9, 9] float tensor from side-to-move perspective."""
     require_torch()
+    board = torch.tensor(game.board, dtype=torch.float32)
     me = game.to_move
     opp = WHITE if me == BLACK else BLACK
     
-    # 3 planes: my stones, opponent stones, all ones (to represent the turn)
-    p0 = []
-    p1 = []
-    p2 = []
-    for r in range(SIZE):
-        row_me = []
-        row_opp = []
-        row_turn = []
-        for c in range(SIZE):
-            v = game.board[r * SIZE + c]
-            row_me.append(1.0 if v == me else 0.0)
-            row_opp.append(1.0 if v == opp else 0.0)
-            row_turn.append(1.0)
-        p0.append(row_me)
-        p1.append(row_opp)
-        p2.append(row_turn)
+    p0 = (board == me).float().view(SIZE, SIZE)
+    p1 = (board == opp).float().view(SIZE, SIZE)
+    p2 = torch.ones((SIZE, SIZE), dtype=torch.float32)
+    return torch.stack([p0, p1, p2]).unsqueeze(0)
+
+
+def encode_games_batch(games: list[GoGame]) -> torch.Tensor:
+    """Return [N, 3, 9, 9] float tensor for a batch of games."""
+    require_torch()
+    if not games:
+        return torch.empty((0, 3, SIZE, SIZE), dtype=torch.float32)
     
-    x = torch.tensor([p0, p1, p2], dtype=torch.float32).unsqueeze(0)
-    return x
+    # Using a list comprehension for boards is still necessary as they are in GoGame objects,
+    # but we move the tensor heavy lifting to vectorized operations.
+    boards = torch.tensor([g.board for g in games], dtype=torch.float32)  # [N, 81]
+    me_colors = torch.tensor([g.to_move for g in games], dtype=torch.float32).view(-1, 1)
+    opp_colors = torch.where(me_colors == BLACK, torch.tensor(WHITE, dtype=torch.float32), torch.tensor(BLACK, dtype=torch.float32))
+
+    p0 = (boards == me_colors).float().view(-1, SIZE, SIZE)
+    p1 = (boards == opp_colors).float().view(-1, SIZE, SIZE)
+    p2 = torch.ones((len(games), SIZE, SIZE), dtype=torch.float32)
+    
+    return torch.stack([p0, p1, p2], dim=1)
 
 
 class PolicyValueModel:
@@ -134,11 +139,16 @@ class PolicyValueModel:
             self.net.load_state_dict(state)
 
     def predict(self, game: GoGame) -> tuple[list[float], float]:
+        probs_list, values = self.predict_batch([game])
+        return probs_list[0], values[0]
+
+    def predict_batch(self, games: list[GoGame]) -> tuple[list[list[float]], list[float]]:
+        if not games:
+            return [], []
         with torch.no_grad():
-            x = encode_game_tensor(game).to(self.device)
-            logits, value = self.net(x)
-            # Softmax to turn logits into probability distribution
-            probs = torch.softmax(logits[0], dim=0).cpu().tolist()
-            v = float(value[0].item())
-            
-        return probs, v
+            x = encode_games_batch(games).to(self.device)
+            logits, values = self.net(x)
+            # Softmax across the move dimension (dim=1 of [N, 81])
+            probs = torch.softmax(logits, dim=1).cpu().tolist()
+            vs = values.cpu().tolist()
+        return probs, vs
