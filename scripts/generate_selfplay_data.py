@@ -62,6 +62,7 @@ def _play_batch_games(
     iterations: int,
     temperature: float,
     add_root_noise: bool,
+    c_puct: float = 1.25,
     progress_queue: Optional[mp.Queue] = None,
     predictor: Optional[PolicyValueModel] = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
@@ -120,7 +121,7 @@ def _play_batch_games(
                 games=active_games,
                 model=current_predictor,
                 iterations=iterations,
-                c_puct=1.4,
+                c_puct=c_puct,
                 roots=roots_to_search,
                 add_root_noise=add_root_noise,
                 rng=random.Random(active_seeds[0] if active_seeds else 0),
@@ -131,7 +132,7 @@ def _play_batch_games(
                     game=active_games[i],
                     predictor=current_predictor,
                     iterations=iterations,
-                    c_puct=1.4,
+                    c_puct=c_puct,
                     root=roots_to_search[i],
                     add_root_noise=add_root_noise,
                     rng=random.Random(active_seeds[i]),
@@ -216,6 +217,8 @@ def main() -> None:
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--c-puct", type=float, default=1.25,
+                   help="Exploration constant for PUCT search.")
     args = p.parse_args()
 
     out_path = pathlib.Path(args.output)
@@ -253,8 +256,9 @@ def main() -> None:
             iterations=args.iterations,
             temperature=args.temperature,
             add_root_noise=not args.no_noise,
+            c_puct=args.c_puct,
             progress_queue=None,
-            predictor=predictor
+            predictor=predictor,
         )
         for st, pol, val, moves, winner, g_idx in results:
             states.append(st)
@@ -284,7 +288,8 @@ def main() -> None:
                     args.max_moves,
                     args.iterations,
                     args.temperature,
-                    not args.no_noise
+                    not args.no_noise,
+                    args.c_puct,
                 ))
                 current_start += num
 
@@ -301,7 +306,7 @@ def main() -> None:
             initargs=(args.predictor_checkpoint, args.device),
         )
         
-        futs = [pool.submit(_play_batch_games, *t, progress_queue) for t in worker_tasks]
+        futs = [pool.submit(_play_batch_games, *t, progress_queue=progress_queue) for t in worker_tasks]
         
         try:
             while games_completed < args.games:

@@ -31,7 +31,7 @@ import pathlib
 import statistics
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -39,9 +39,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ai.agent import MCTSAgent
-from engine.go_engine import BLACK, WHITE, GoGame
+from engine.go_engine import BLACK, EMPTY, SIZE, WHITE, GoGame
 
 DEFAULT_CSV = "eval_results.csv"
+DEFAULT_MD_SUBDIR = "eval_boards"
+# Go-convention column letters skip "I".
+_COL_LETTERS = "ABCDEFGHJ"
 CSV_COLUMNS = [
     "timestamp",
     "match_id",
@@ -76,6 +79,8 @@ class AgentSpec:
     iterations: int
     engine: str = "mcts"
     model_path: Optional[str] = None
+    c_puct: float = 1.25
+    add_root_noise: bool = False
 
 
 def _build_agent(spec: AgentSpec, seed: int):
@@ -85,7 +90,8 @@ def _build_agent(spec: AgentSpec, seed: int):
             iterations=spec.iterations,
             model_path=spec.model_path,
             seed=seed,
-            add_root_noise=True,
+            c_puct=spec.c_puct,
+            add_root_noise=spec.add_root_noise,
         )
     if spec.engine == "gnugo":
         from ai.gnugo_agent import GnuGoAgent
@@ -110,6 +116,12 @@ class GameResult:
     gnu_winner_name: str = ""
     gnu_margin_for_black: Optional[float] = None
     score_match: Optional[bool] = None
+    # Final-position snapshot for the markdown report. dead_* are only
+    # non-empty when the game ended via two passes (Benson path); for
+    # concession / move-cap finishes they stay empty.
+    final_board: list[int] = field(default_factory=list)
+    dead_black: set[int] = field(default_factory=set)
+    dead_white: set[int] = field(default_factory=set)
 
 
 def _play_one_game(
@@ -150,6 +162,15 @@ def _play_one_game(
     s = game.score()
     winner_name = black_spec.name if s["winner"] == BLACK else white_spec.name
 
+    # Mirror the engine's dead-stone path purely for markdown reporting:
+    # only when the game ended via two passes (same gate as score()).
+    dead_black: set[int] = set()
+    dead_white: set[int] = set()
+    if game.finished and game.loser is None:
+        alive_b = game._benson_alive(BLACK)
+        alive_w = game._benson_alive(WHITE)
+        dead_black, dead_white = game._dead_chains(alive_b, alive_w)
+
     gnu_winner_name = ""
     gnu_margin_for_black: Optional[float] = None
     score_match: Optional[bool] = None
@@ -189,7 +210,91 @@ def _play_one_game(
         gnu_winner_name=gnu_winner_name,
         gnu_margin_for_black=gnu_margin_for_black,
         score_match=score_match,
+        final_board=list(game.board),
+        dead_black=dead_black,
+        dead_white=dead_white,
     )
+
+
+def _board_md_table(
+    board: list[int], dead_black: set[int], dead_white: set[int]
+) -> str:
+    """Render the final board as a markdown table.
+
+    Cells: `B`/`W` for live stones, `b`/`w` for dead (will be removed
+    when scoring), `.` for empty. Rows are labeled 9..1 top-to-bottom
+    and columns A..J skipping I, matching standard Go notation.
+    """
+    header = "|   | " + " | ".join(_COL_LETTERS) + " |"
+    sep = "|---|" + "|".join(["---"] * SIZE) + "|"
+    lines = [header, sep]
+    for r in range(SIZE):
+        row_label = SIZE - r
+        cells: list[str] = []
+        for c in range(SIZE):
+            idx = r * SIZE + c
+            v = board[idx]
+            if v == BLACK:
+                cells.append("b" if idx in dead_black else "B")
+            elif v == WHITE:
+                cells.append("w" if idx in dead_white else "W")
+            else:
+                cells.append(".")
+        lines.append(f"| {row_label} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _write_md_header(
+    md_path: pathlib.Path, match_id: str, a: AgentSpec, b: AgentSpec
+) -> None:
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    with md_path.open("w") as f:
+        f.write(f"# Match: {match_id}\n\n")
+        for spec in (a, b):
+            f.write(
+                f"- **{spec.name}** — engine={spec.engine} "
+                f"iters={spec.iterations} model={spec.model_path or '-'}\n"
+            )
+        f.write(
+            "\nLegend: `B`/`W` = live stone, `b`/`w` = dead "
+            "(scored as opponent territory), `.` = empty.\n\n"
+        )
+
+
+def _append_md_game(
+    md_path: pathlib.Path, game_idx: int, r: GameResult
+) -> None:
+    table = _board_md_table(r.final_board, r.dead_black, r.dead_white)
+    finished_kind = "finished" if r.finished else "move cap (not finished)"
+    dead_count = len(r.dead_black) + len(r.dead_white)
+    with md_path.open("a") as f:
+        f.write(
+            f"## Game {game_idx + 1}: {r.black_spec.name} (B) vs "
+            f"{r.white_spec.name} (W)\n\n"
+        )
+        f.write(
+            f"- **Winner:** {r.winner_name}\n"
+            f"- **Score:** B={r.black_score:.1f}  W={r.white_score:.1f} "
+            f"(margin for B: {r.margin_for_black:+.1f})\n"
+            f"- **Moves:** {r.moves}  ·  **End:** {finished_kind}\n"
+        )
+        if dead_count:
+            f.write(
+                f"- **Dead stones removed:** "
+                f"black={len(r.dead_black)}  white={len(r.dead_white)}\n"
+            )
+        if r.score_match is True:
+            f.write(
+                f"- **GNU Go cross-check:** agreed "
+                f"(gnu margin for B = {r.gnu_margin_for_black:+.1f})\n"
+            )
+        elif r.score_match is False:
+            f.write(
+                f"- **GNU Go cross-check:** DISAGREED — "
+                f"gnu winner={r.gnu_winner_name}, "
+                f"gnu margin for B = {r.gnu_margin_for_black:+.1f}\n"
+            )
+        f.write("\n" + table + "\n\n")
 
 
 def _check_csv_schema(csv_path: pathlib.Path) -> None:
@@ -274,14 +379,25 @@ def main() -> None:
     p.add_argument("--b-model", type=str, default=None)
     p.add_argument("--csv", default=DEFAULT_CSV,
                    help=f"CSV output path (default: {DEFAULT_CSV}). Pass empty string to disable.")
+    p.add_argument("--md", default=None,
+                   help=("Markdown report path. Default: auto-derived as "
+                         f"<csv_dir>/{DEFAULT_MD_SUBDIR}/<match_id>.md. "
+                         "Pass empty string to disable."))
     p.add_argument("--gate-threshold", type=float, default=None,
                    help="If set, exit code 0 only when A's win rate >= this value (e.g. 0.55).")
+    p.add_argument("--c-puct", type=float, default=1.25,
+                   help="Exploration constant for PUCT (lower = more exploitation).")
+    p.add_argument("--add-noise", action="store_true",
+                   help="Enable Dirichlet root noise for PUCT (off by default — "
+                        "evaluation should not inject exploration noise).")
     args = p.parse_args()
 
     a = AgentSpec(name=args.a_name, iterations=args.a_iters,
-                  engine=args.a_engine, model_path=args.a_model)
+                  engine=args.a_engine, model_path=args.a_model,
+                  c_puct=args.c_puct, add_root_noise=args.add_noise)
     b = AgentSpec(name=args.b_name, iterations=args.b_iters,
-                  engine=args.b_engine, model_path=args.b_model)
+                  engine=args.b_engine, model_path=args.b_model,
+                  c_puct=args.c_puct, add_root_noise=args.add_noise)
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     match_id = f"{a.name}_vs_{b.name}_{timestamp}"
@@ -294,10 +410,20 @@ def main() -> None:
             csv_path.parent.mkdir(parents=True, exist_ok=True)
         _check_csv_schema(csv_path)
 
+    md_path: Optional[pathlib.Path] = None
+    if args.md is None:
+        md_root = csv_path.parent if csv_path is not None else pathlib.Path(".")
+        md_path = md_root / DEFAULT_MD_SUBDIR / f"{match_id}.md"
+    elif args.md != "":
+        md_path = pathlib.Path(args.md)
+    if md_path is not None:
+        _write_md_header(md_path, match_id, a, b)
+
     print(f"match: {match_id}")
     print(f"  {a.name}: engine={a.engine} iters={a.iterations} model={a.model_path or '-'}")
     print(f"  {b.name}: engine={b.engine} iters={b.iterations} model={b.model_path or '-'}")
     print(f"  csv: {csv_path or '(disabled)'}")
+    print(f"  md:  {md_path or '(disabled)'}")
 
     results: list[GameResult] = []
     started = time.perf_counter()
@@ -346,6 +472,8 @@ def main() -> None:
 
             if csv_path is not None:
                 _append_csv(csv_path, [result], timestamp, match_id, start_index=i)
+            if md_path is not None:
+                _append_md_game(md_path, i, result)
     except KeyboardInterrupt:
         print("\nInterrupted; reporting on completed games.")
 
@@ -407,6 +535,8 @@ def main() -> None:
 
     if csv_path is not None:
         print(f"Per-game rows appended to {csv_path}")
+    if md_path is not None:
+        print(f"Per-game boards written to {md_path}")
 
     if args.gate_threshold is not None:
         passed = a_winrate >= args.gate_threshold

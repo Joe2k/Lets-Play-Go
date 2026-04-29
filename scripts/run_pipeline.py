@@ -113,6 +113,7 @@ def _self_play(
     seed_base: int,
     workers: int = 1,
     batch_size: int = 32,
+    c_puct: float = 1.25,
 ) -> None:
     if out_path.exists() and state.gen(gen_idx).get("self_play_done"):
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
@@ -128,6 +129,7 @@ def _self_play(
         "--device", device,
         "--workers", str(workers),
         "--batch-size", str(batch_size),
+        "--c-puct", str(c_puct),
     ]
     predictor = state.best_checkpoint()
     if predictor is not None:
@@ -143,7 +145,7 @@ def _self_play(
 def _train(
     state: PipelineState,
     gen_idx: int,
-    data_path: pathlib.Path,
+    data_paths: list[pathlib.Path],
     out_path: pathlib.Path,
     epochs: int,
     batch_size: int,
@@ -157,7 +159,7 @@ def _train(
     cmd = [
         PYTHON,
         str(ROOT / "scripts" / "train_policy_value.py"),
-        "--data", str(data_path),
+        "--data", *[str(p) for p in data_paths],
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--lr", str(lr),
@@ -183,6 +185,7 @@ def _gate_eval(
     iterations: int,
     threshold: float,
     csv_path: pathlib.Path,
+    c_puct: float = 1.25,
 ) -> tuple[bool, Optional[float]]:
     """Returns (promoted, win_rate). Win rate is None if eval was skipped."""
     if state.gen(gen_idx).get("eval_done"):
@@ -211,13 +214,13 @@ def _gate_eval(
         "--b-iters", str(iterations),
         "--csv", str(csv_path),
         "--gate-threshold", str(threshold),
+        "--c-puct", str(c_puct),
     ]
     started = time.perf_counter()
     _run(cmd)
     elapsed = time.perf_counter() - started
-    promoted = True  # Auto-promote to save time and ensure progress
-    # Parse the win rate out of the per-game CSV (last match_id rows).
     win_rate = _winrate_from_csv(csv_path, expected_a_name=f"gen{gen_idx}")
+    promoted = win_rate is not None and win_rate >= threshold
     state.update_gen(
         gen_idx,
         eval_done=True,
@@ -264,16 +267,26 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--eval-games", type=int, default=5,
-                   help="Games per gate-eval match.")
+    p.add_argument("--eval-games", type=int, default=30,
+                   help="Games per gate-eval match. Below ~30 the win-rate "
+                        "estimate is too noisy to gate at 0.55.")
     p.add_argument("--eval-iters", type=int, default=200)
-    p.add_argument("--gate-threshold", type=float, default=0.52,
+    p.add_argument("--gate-threshold", type=float, default=0.55,
                    help="Win rate needed to promote a new checkpoint.")
+    p.add_argument("--replay-window", type=int, default=5,
+                   help="Train each generation on the last N self-play datasets "
+                        "(sliding replay buffer). 1 = each gen sees only its own data.")
+    p.add_argument("--c-puct", type=float, default=1.25,
+                   help="PUCT exploration constant for self-play AND gate eval. "
+                        "Lower = more exploitation; AlphaGo Zero used 1.25, "
+                        "KataGo ~1.1.")
     p.add_argument("--workers", type=int, default=1,
                    help="Parallel workers for self-play data generation.")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--seed-base", type=int, default=0)
     args = p.parse_args()
+    if args.replay_window < 1:
+        raise SystemExit("--replay-window must be >= 1")
 
     run_dir = pathlib.Path(args.run_dir)
     data_dir = run_dir / "data"
@@ -300,9 +313,20 @@ def main() -> None:
                    device=args.device,
                    seed_base=args.seed_base,
                    workers=args.workers,
-                   batch_size=args.batch_size)
+                   batch_size=args.batch_size,
+                   c_puct=args.c_puct)
 
-        _train(state, gen, data_path, ckpt_path,
+        # Sliding replay window: train on the last `replay_window`
+        # self-play datasets that actually exist on disk.
+        window_start = max(0, gen - args.replay_window + 1)
+        train_paths: list[pathlib.Path] = []
+        for g in range(window_start, gen + 1):
+            p_path = data_dir / f"selfplay_g{g}.pt"
+            if p_path.exists():
+                train_paths.append(p_path)
+        print(f"[gen {gen}] replay window: {[p.name for p in train_paths]}")
+
+        _train(state, gen, train_paths, ckpt_path,
                epochs=args.epochs,
                batch_size=args.batch_size,
                lr=args.lr,
@@ -314,6 +338,7 @@ def main() -> None:
             iterations=args.eval_iters,
             threshold=args.gate_threshold,
             csv_path=eval_csv,
+            c_puct=args.c_puct,
         )
 
         if promoted:

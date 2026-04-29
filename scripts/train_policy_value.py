@@ -48,7 +48,8 @@ def _augment_batch(states: "torch.Tensor", policy: "torch.Tensor"):
 def main() -> None:
     require_torch()
     p = argparse.ArgumentParser(description="Train policy-value model")
-    p.add_argument("--data", type=str, default="data/selfplay.pt")
+    p.add_argument("--data", type=str, nargs="+", default=["data/selfplay.pt"],
+                   help="One or more self-play datasets to concatenate (replay window).")
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -70,13 +71,22 @@ def main() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    blob = torch.load(args.data, map_location="cpu")
-    states = blob["states"].float()
-    policy = blob["policy"].float()
-    value = blob["value"].float()
+    states_chunks: list["torch.Tensor"] = []
+    policy_chunks: list["torch.Tensor"] = []
+    value_chunks: list["torch.Tensor"] = []
+    for path in args.data:
+        blob = torch.load(path, map_location="cpu")
+        states_chunks.append(blob["states"].float())
+        policy_chunks.append(blob["policy"].float())
+        value_chunks.append(blob["value"].float())
+        print(f"loaded {blob['states'].shape[0]} samples from {path}", flush=True)
+    states = torch.cat(states_chunks, dim=0)
+    policy = torch.cat(policy_chunks, dim=0)
+    value = torch.cat(value_chunks, dim=0)
     n = states.shape[0]
     if n == 0:
         raise RuntimeError("dataset is empty; run generate_selfplay_data.py first")
+    print(f"training on {n} total samples from {len(args.data)} file(s)", flush=True)
 
     device = torch.device(args.device)
     model = TinyPolicyValueNet().to(device)
