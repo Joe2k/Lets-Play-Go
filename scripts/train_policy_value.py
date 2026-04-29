@@ -52,6 +52,12 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-min", type=float, default=1e-5,
+                   help="Minimum learning rate for decay scheduler.")
+    p.add_argument("--patience", type=int, default=3,
+                   help="Number of epochs to wait for improvement before early stopping.")
+    p.add_argument("--min-delta", type=float, default=0.01,
+                   help="Minimum change in loss to qualify as an improvement.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default="checkpoints/pv_latest.pt")
     p.add_argument("--device", type=str, default="cpu")
@@ -82,6 +88,9 @@ def main() -> None:
     model.train()
     # Use AdamW with weight decay to prevent overfitting on small self-play datasets.
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=args.epochs, eta_min=args.lr_min
+    )
 
     out_path = pathlib.Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +100,9 @@ def main() -> None:
         print(f"[{reason}] saved checkpoint to {out_path}", flush=True)
 
     indices = list(range(n))
+    best_loss = float("inf")
+    epochs_without_improvement = 0
+    
     try:
         for epoch in range(1, args.epochs + 1):
             random.shuffle(indices)
@@ -126,14 +138,28 @@ def main() -> None:
                 epoch_v_loss += float(value_loss.item())
                 batches += 1
 
+            avg_loss = epoch_loss / batches
             print(
                 f"epoch {epoch:2d}/{args.epochs} | "
-                f"loss={epoch_loss / batches:.4f} | "
+                f"loss={avg_loss:.4f} | "
                 f"p_loss={epoch_p_loss / batches:.4f} | "
-                f"v_loss={epoch_v_loss / batches:.4f}",
+                f"v_loss={epoch_v_loss / batches:.4f} | "
+                f"lr={scheduler.get_last_lr()[0]:.2e}",
                 flush=True
             )
+            
+            scheduler.step()
             _save(f"epoch {epoch}")
+
+            # Early stopping check
+            if avg_loss < (best_loss - args.min_delta):
+                best_loss = avg_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= args.patience:
+                    print(f"Early stopping triggered: loss has not improved for {args.patience} epochs.")
+                    break
     except KeyboardInterrupt:
         print("\nInterrupted — saving latest weights.")
         _save("interrupted")
