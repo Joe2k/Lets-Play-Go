@@ -27,7 +27,12 @@ class GnuGoAgent:
     def _start_gnugo(self) -> None:
         try:
             self._proc = subprocess.Popen(
-                [self.gnugo_path, "--mode", "gtp", "--level", str(self.level)],
+                # --chinese-rules makes final_score use area scoring, which
+                # matches GoGame.score(). Without it GNU Go defaults to
+                # Japanese counting and the two scores will disagree by a
+                # small constant on most positions.
+                [self.gnugo_path, "--mode", "gtp", "--chinese-rules",
+                 "--level", str(self.level)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -87,28 +92,59 @@ class GnuGoAgent:
     def select_move(self, game: GoGame) -> Move:
         if self._proc is None:
             return "pass"
-
-        # Sync board state using history
-        self._send_command("clear_board")
-        
-        current_to_move = BLACK
-        for move in game.history:
-            c_str = "black" if current_to_move == BLACK else "white"
-            self._send_command(f"play {c_str} {self._to_gtp_coords(move)}")
-            current_to_move = WHITE if current_to_move == BLACK else BLACK
-
+        self._sync_to_history(game)
         my_color = "black" if game.to_move == BLACK else "white"
         res = self._send_command(f"genmove {my_color}")
-        
         if res.startswith("="):
-            move_str = res[1:].strip()
-            return self._from_gtp_coords(move_str)
-        
+            return self._from_gtp_coords(res[1:].strip())
         return "pass"
 
     def reset(self) -> None:
         if self._proc:
             self._send_command("clear_board")
+
+    def _sync_to_history(self, game: GoGame) -> None:
+        """Replay GoGame.history into GNU Go from a clear board.
+
+        "concede" is not a real GTP move, so we skip it: the engine has
+        already marked the game as finished, and GNU Go just needs to see
+        the actual stones placed and passes that occurred.
+        """
+        if self._proc is None:
+            return
+        self._send_command("clear_board")
+        side = BLACK
+        for move in game.history:
+            if move == "concede":
+                continue
+            color_str = "black" if side == BLACK else "white"
+            self._send_command(f"play {color_str} {self._to_gtp_coords(move)}")
+            side = WHITE if side == BLACK else BLACK
+
+    def final_score(self, game: GoGame) -> Optional[dict]:
+        """Ask GNU Go for its area-scoring verdict on the current position.
+
+        Returns {"winner": BLACK | WHITE | None, "margin": float, "raw": str}
+        or None if the GTP query failed. None winner means jigo (tie).
+        """
+        if self._proc is None:
+            return None
+        self._sync_to_history(game)
+        res = self._send_command("final_score")
+        if not res.startswith("="):
+            return None
+        text = res[1:].strip()
+        if text == "0":
+            return {"winner": None, "margin": 0.0, "raw": text}
+        if len(text) >= 3 and text[1] == "+":
+            head = text[0].upper()
+            try:
+                margin = float(text[2:])
+            except ValueError:
+                return None
+            winner = BLACK if head == "B" else WHITE if head == "W" else None
+            return {"winner": winner, "margin": margin, "raw": text}
+        return None
 
     def __del__(self) -> None:
         if self._proc:

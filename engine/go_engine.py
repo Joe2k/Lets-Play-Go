@@ -196,10 +196,29 @@ class GoGame:
         self.pass_turn()
 
     def score(self) -> dict:
-        black_stones = sum(1 for v in self.board if v == BLACK)
-        white_stones = sum(1 for v in self.board if v == WHITE)
-        black_territory, white_territory = self._territory()
-        neutral_points = self.board.count(EMPTY) - black_territory - white_territory
+        # Dead-stone detection (Benson's unconditional life + conservative
+        # enclosure rule) only kicks in when the game ended via two passes.
+        # Concession path is left alone — the loser is forced. Mid-game and
+        # not-yet-finished positions use the pure boundary-color rule so the
+        # GUI's live score display is unchanged.
+        if self.finished and self.loser is None:
+            self._ensure_groups()
+            alive_b = self._benson_alive(BLACK)
+            alive_w = self._benson_alive(WHITE)
+            dead_b, dead_w = self._dead_chains(alive_b, alive_w)
+            black_stones, white_stones, black_territory, white_territory = (
+                self._score_with_dead_removed(dead_b | dead_w)
+            )
+        else:
+            black_stones = self.board.count(BLACK)
+            white_stones = self.board.count(WHITE)
+            black_territory, white_territory = self._territory()
+
+        # Reported relative to the (possibly dead-removed) synthetic board so
+        # stones + territory + neutral always sums to the full board.
+        neutral_points = (
+            (SIZE * SIZE) - black_stones - white_stones - black_territory - white_territory
+        )
 
         black_total = black_stones + black_territory
         white_total = white_stones + white_territory + KOMI
@@ -366,3 +385,201 @@ class GoGame:
             elif borders == {WHITE}:
                 white_t += len(region)
         return black_t, white_t
+
+    # ---------- dead-stone detection (Benson's unconditional life) ----------
+    #
+    # We use this only when the game ended via two passes (see score()). The
+    # algorithm is conservative: it only kills groups that are not Benson-
+    # alive AND are fully enclosed by Benson-alive enemy chains. So it will
+    # under-kill in seki and complex shapes but never wrongly remove a group
+    # that has any chance to live.
+
+    def _benson_alive(self, color: int) -> set[int]:
+        """Group-ids of `color` that are unconditionally alive.
+
+        A chain is unconditionally alive iff it has at least 2 "vital small"
+        regions with respect to a candidate set S that itself satisfies the
+        condition. We compute the largest such S by iteratively dropping any
+        chain that fails the test. See Benson 1976.
+        """
+        own_gids = [gid for gid, gr in self._groups.items() if gr.color == color]
+        if not own_gids:
+            return set()
+
+        # 1. Find the color-regions: maximal 4-connected components of
+        #    (EMPTY ∪ opposite-color) cells. Track which of `color`'s chains
+        #    border each region, and the set of empty cells in the region.
+        opp = _other(color)
+        visited = [False] * (SIZE * SIZE)
+        # region_idx -> (empty_cells, border_gids)
+        regions: list[tuple[set[int], set[int]]] = []
+        for start in range(SIZE * SIZE):
+            if visited[start] or self.board[start] == color:
+                continue
+            empty_cells: set[int] = set()
+            border_gids: set[int] = set()
+            queue = deque([start])
+            visited[start] = True
+            while queue:
+                idx = queue.popleft()
+                v = self.board[idx]
+                if v == EMPTY:
+                    empty_cells.add(idx)
+                # Whether v is EMPTY or opp, walk neighbors.
+                for nidx in self._neighbors_of(idx):
+                    nv = self.board[nidx]
+                    if nv == color:
+                        border_gids.add(self._gid_by_idx[nidx])
+                    elif not visited[nidx]:
+                        visited[nidx] = True
+                        queue.append(nidx)
+            regions.append((empty_cells, border_gids))
+
+        # 2. For each (region, chain) pair, precompute "vital": every empty
+        #    cell in the region is adjacent to at least one stone of the
+        #    chain. This depends only on the position, not on S.
+        vital: dict[tuple[int, int], bool] = {}
+        for ri, (empty_cells, border_gids) in enumerate(regions):
+            for gid in border_gids:
+                stones = self._groups[gid].stones
+                ok = True
+                for ec in empty_cells:
+                    if not any(n in stones for n in self._neighbors_of(ec)):
+                        ok = False
+                        break
+                vital[(ri, gid)] = ok
+
+        # 3. Iterate: drop any chain in S without ≥2 regions that are
+        #    "small wrt S" (every border_gid in S) AND vital for it.
+        S = set(own_gids)
+        while True:
+            changed = False
+            for gid in list(S):
+                count = 0
+                for ri, (_empty, border_gids) in enumerate(regions):
+                    if gid not in border_gids:
+                        continue
+                    if not border_gids.issubset(S):
+                        continue
+                    if vital.get((ri, gid), False):
+                        count += 1
+                        if count >= 2:
+                            break
+                if count < 2:
+                    S.discard(gid)
+                    changed = True
+            if not changed:
+                break
+        return S
+
+    def _dead_chains(
+        self, alive_black: set[int], alive_white: set[int]
+    ) -> tuple[set[int], set[int]]:
+        """Conservative dead-stone detection.
+
+        A chain X of color C is dead iff:
+          - X is not in alive_C, AND
+          - flood-filling from X through EMPTY cells and other own-color
+            chains reaches at least one opponent chain, and EVERY opponent
+            chain reached is in alive_(-C).
+
+        Returns (dead_black_indices, dead_white_indices) as flat-board
+        index sets. Opponent stones terminate the flood (we never cross
+        them); they are recorded as boundaries.
+        """
+        dead_black: set[int] = set()
+        dead_white: set[int] = set()
+        seen_chains_dead: set[int] = set()
+        for gid, gr in self._groups.items():
+            if gid in seen_chains_dead:
+                continue
+            color = gr.color
+            alive_us = alive_black if color == BLACK else alive_white
+            alive_them = alive_white if color == BLACK else alive_black
+            if gid in alive_us:
+                continue
+
+            # BFS from this chain through empties and same-color chains.
+            visited = set(gr.stones)
+            queue = deque(gr.stones)
+            visited_chains = {gid}
+            opp_chains_touched: set[int] = set()
+            while queue:
+                idx = queue.popleft()
+                for nidx in self._neighbors_of(idx):
+                    if nidx in visited:
+                        continue
+                    nv = self.board[nidx]
+                    ngid = self._gid_by_idx[nidx]
+                    if nv == EMPTY:
+                        visited.add(nidx)
+                        queue.append(nidx)
+                    elif nv == color:
+                        # Same-color chain: absorb it into our flood.
+                        if ngid not in visited_chains:
+                            visited_chains.add(ngid)
+                            for s in self._groups[ngid].stones:
+                                if s not in visited:
+                                    visited.add(s)
+                                    queue.append(s)
+                    else:
+                        # Opponent stone: record boundary, don't cross.
+                        opp_chains_touched.add(ngid)
+
+            # Dead iff we touched any opponent and every opponent we touched
+            # is unconditionally alive.
+            if opp_chains_touched and opp_chains_touched.issubset(alive_them):
+                target = dead_black if color == BLACK else dead_white
+                for cgid in visited_chains:
+                    target.update(self._groups[cgid].stones)
+                    seen_chains_dead.add(cgid)
+            else:
+                # Don't reconsider chains we already merged into this flood.
+                seen_chains_dead.update(visited_chains)
+        return dead_black, dead_white
+
+    def _score_with_dead_removed(
+        self, dead: set[int]
+    ) -> tuple[int, int, int, int]:
+        """Return (black_stones, white_stones, black_territory, white_territory)
+        on a synthetic board where `dead` indices are treated as EMPTY.
+
+        Does NOT mutate self.board or self._groups. Uses the same boundary-
+        color flood as _territory().
+        """
+        if not dead:
+            bt, wt = self._territory()
+            return self.board.count(BLACK), self.board.count(WHITE), bt, wt
+
+        board = list(self.board)
+        for s in dead:
+            board[s] = EMPTY
+        black_stones = board.count(BLACK)
+        white_stones = board.count(WHITE)
+
+        visited = [False] * (SIZE * SIZE)
+        black_t = 0
+        white_t = 0
+        for start in range(SIZE * SIZE):
+            if visited[start] or board[start] != EMPTY:
+                continue
+            region: list[int] = []
+            borders: set[int] = set()
+            queue = deque([start])
+            visited[start] = True
+            while queue:
+                idx = queue.popleft()
+                region.append(idx)
+                for nidx in self._neighbors_of(idx):
+                    v = board[nidx]
+                    if v == EMPTY:
+                        if not visited[nidx]:
+                            visited[nidx] = True
+                            queue.append(nidx)
+                    else:
+                        borders.add(v)
+            if borders == {BLACK}:
+                black_t += len(region)
+            elif borders == {WHITE}:
+                white_t += len(region)
+        return black_stones, white_stones, black_t, white_t

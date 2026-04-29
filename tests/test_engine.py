@@ -282,3 +282,95 @@ def test_score_dame_not_counted():
     assert r["white_stones"] == 1
     assert r["black"] == 1
     assert r["white"] == pytest.approx(1 + KOMI)
+
+
+def test_benson_recognises_two_eyes_as_alive():
+    # Black group with two 1-point eyes.
+    b = blank_board()
+    # Eyes at (1,1) and (1,3).
+    # Connected stones:
+    stones = [
+        (0,0), (0,1), (0,2), (0,3), (0,4),
+        (1,0), (1,2), (1,4),
+        (2,0), (2,1), (2,2), (2,3), (2,4)
+    ]
+    for r, c in stones:
+        b[r][c] = BLACK
+    g = GoGame.from_position(b)
+    alive = g._benson_alive(BLACK)
+    assert len(alive) == 1
+
+
+def test_benson_rejects_one_eye():
+    # Black group with only one eye.
+    b = blank_board()
+    # Eye at (1,1).
+    stones = [
+        (0,0), (0,1), (0,2),
+        (1,0), (1,2),
+        (2,0), (2,1), (2,2)
+    ]
+    for r, c in stones:
+        b[r][c] = BLACK
+    g = GoGame.from_position(b)
+    alive = g._benson_alive(BLACK)
+    assert len(alive) == 0
+
+
+def test_dead_chains_isolated_stone_not_killed():
+    # Single black stone on empty board. Should NOT be killed.
+    b = blank_board()
+    b[4][4] = BLACK
+    g = GoGame.from_position(b)
+    alive_b = g._benson_alive(BLACK)
+    alive_w = g._benson_alive(WHITE)
+    db, dw = g._dead_chains(alive_b, alive_w)
+    assert len(db) == 0
+    assert len(dw) == 0
+
+
+def test_dead_chains_seki_not_killed():
+    # Simple seki: two groups share liberties, neither has eyes.
+    b = blank_board()
+    # B: (0,1), (1,0), (2,1)
+    # W: (0,2), (1,3), (2,2)
+    # Liberties at (1,1), (1,2)
+    b[0][1] = BLACK; b[1][0] = BLACK; b[2][1] = BLACK
+    b[0][2] = WHITE; b[1][3] = WHITE; b[2][2] = WHITE
+    g = GoGame.from_position(b)
+    alive_b = g._benson_alive(BLACK)
+    alive_w = g._benson_alive(WHITE)
+    db, dw = g._dead_chains(alive_b, alive_w)
+    assert len(db) == 0
+    assert len(dw) == 0
+
+
+def test_score_dead_stones_removed_simple():
+    # White group with no eyes enclosed by a Black group with two eyes.
+    b = blank_board()
+    # Black group enclosing 5x5 area with stones at perimeter
+    # and two eyes inside.
+    for r in range(5):
+        for c in range(5):
+            if r == 0 or r == 4 or c == 0 or c == 4:
+                b[r][c] = BLACK
+    # More stones to connect and form eyes
+    b[1][2] = BLACK; b[2][2] = BLACK; b[3][2] = BLACK
+    # Eyes at (1,1) and (1,3).
+    # White stone at (3,1) - enclosed but not in an eye.
+    b[3][1] = WHITE
+    
+    g = GoGame.from_position(b)
+    g.pass_turn()
+    g.pass_turn()
+    assert g.finished
+    
+    r = g.score()
+    # White stone at (3,1) should be dead.
+    assert r["white_stones"] == 0
+    # The whole 9x9 board minus black stones should be black territory
+    # because only Black has alive stones.
+    # Black stones: perimeter(16) + internal(3) = 19.
+    # Total cells = 81. Territory = 81 - 19 = 62.
+    assert r["black_stones"] == 19
+    assert r["black_territory"] == 62

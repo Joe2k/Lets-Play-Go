@@ -62,6 +62,11 @@ CSV_COLUMNS = [
     "finished",
     "black_avg_ms",
     "white_avg_ms",
+    # Cross-check from GNU Go's final_score (only filled when one side is
+    # gnugo and the game ended via two passes). "" otherwise.
+    "gnu_winner_name",
+    "gnu_margin_for_black",
+    "score_match",
 ]
 
 
@@ -100,6 +105,11 @@ class GameResult:
     finished: bool
     black_avg_ms: float
     white_avg_ms: float
+    # GNU Go cross-check: "" / NaN / "" when not applicable, otherwise
+    # populated from final_score on a gnugo participant.
+    gnu_winner_name: str = ""
+    gnu_margin_for_black: Optional[float] = None
+    score_match: Optional[bool] = None
 
 
 def _play_one_game(
@@ -139,6 +149,32 @@ def _play_one_game(
 
     s = game.score()
     winner_name = black_spec.name if s["winner"] == BLACK else white_spec.name
+
+    gnu_winner_name = ""
+    gnu_margin_for_black: Optional[float] = None
+    score_match: Optional[bool] = None
+    # Only meaningful when a gnugo agent is in play AND the game ended
+    # via two consecutive passes — concession or move-cap termination
+    # leave dead stones / unsettled groups that final_score can't judge.
+    from ai.gnugo_agent import GnuGoAgent
+    gnu_agent = next(
+        (ag for ag in (black_agent, white_agent) if isinstance(ag, GnuGoAgent)),
+        None,
+    )
+    if (gnu_agent is not None
+            and game.finished
+            and len(game.history) >= 2
+            and game.history[-1] == "pass"
+            and game.history[-2] == "pass"):
+        gnu_score = gnu_agent.final_score(game)
+        if gnu_score is not None and gnu_score["winner"] is not None:
+            gw = gnu_score["winner"]
+            gnu_winner_name = black_spec.name if gw == BLACK else white_spec.name
+            gnu_margin_for_black = (
+                gnu_score["margin"] if gw == BLACK else -gnu_score["margin"]
+            )
+            score_match = (gw == s["winner"])
+
     return GameResult(
         black_spec=black_spec,
         white_spec=white_spec,
@@ -150,6 +186,9 @@ def _play_one_game(
         finished=game.finished,
         black_avg_ms=(statistics.mean(black_latencies) if black_latencies else 0.0),
         white_avg_ms=(statistics.mean(white_latencies) if white_latencies else 0.0),
+        gnu_winner_name=gnu_winner_name,
+        gnu_margin_for_black=gnu_margin_for_black,
+        score_match=score_match,
     )
 
 
@@ -185,6 +224,13 @@ def _append_csv(
         if write_header:
             w.writerow(CSV_COLUMNS)
         for offset, r in enumerate(rows):
+            score_match_cell = (
+                "" if r.score_match is None else int(r.score_match)
+            )
+            gnu_margin_cell = (
+                "" if r.gnu_margin_for_black is None
+                else f"{r.gnu_margin_for_black:.2f}"
+            )
             w.writerow(
                 [
                     timestamp,
@@ -206,6 +252,9 @@ def _append_csv(
                     int(r.finished),
                     f"{r.black_avg_ms:.2f}",
                     f"{r.white_avg_ms:.2f}",
+                    r.gnu_winner_name,
+                    gnu_margin_cell,
+                    score_match_cell,
                 ]
             )
 
@@ -279,11 +328,20 @@ def main() -> None:
 
             played = i + 1
             wr = a_wins_running / played * 100.0
+            score_note = ""
+            if result.score_match is False:
+                score_note = (
+                    f" [score MISMATCH: ours={result.winner_name}"
+                    f" ({result.margin_for_black:+.1f}) vs"
+                    f" gnu={result.gnu_winner_name}"
+                    f" ({result.gnu_margin_for_black:+.1f})]"
+                )
             print(
                 f"  [{played}/{args.games}] {result.black_spec.name}(B) vs {result.white_spec.name}(W) "
                 f"-> {result.winner_name} | score {result.black_score:.1f}-{result.white_score:.1f} "
                 f"| {result.moves} moves | {game_dt:.1f}s | "
                 f"{a.name}={a_wins_running} {b.name}={b_wins_running} ({wr:.1f}%)"
+                f"{score_note}"
             )
 
             if csv_path is not None:
@@ -329,6 +387,23 @@ def main() -> None:
     print(f"Avg score margin for {a.name}: {avg_margin_for_a:+.2f}")
     print(f"{a.name} avg move latency: {statistics.mean(a_move_latencies):.2f} ms")
     print(f"{b.name} avg move latency: {statistics.mean(b_move_latencies):.2f} ms")
+
+    score_compared = [r for r in results if r.score_match is not None]
+    if score_compared:
+        agreed = sum(1 for r in score_compared if r.score_match)
+        disagreed = len(score_compared) - agreed
+        print(
+            f"GNU score cross-check: {agreed}/{len(score_compared)} agree "
+            f"({disagreed} disagree)"
+        )
+        if disagreed:
+            print("  disagreements (game_idx | ours -> gnu):")
+            for i, r in enumerate(results):
+                if r.score_match is False:
+                    print(
+                        f"    {i}: {r.winner_name}({r.margin_for_black:+.1f}) "
+                        f"-> {r.gnu_winner_name}({r.gnu_margin_for_black:+.1f})"
+                    )
 
     if csv_path is not None:
         print(f"Per-game rows appended to {csv_path}")
