@@ -345,6 +345,43 @@ def test_dead_chains_seki_not_killed():
     assert len(dw) == 0
 
 
+def test_dead_chains_does_not_drag_alive_ally():
+    # Regression: a single isolated black stone with one liberty inside
+    # an eye-region of an alive ally chain must not drag the ally into
+    # the dead set. Originally, the BFS in _dead_chains absorbed any
+    # same-color neighbor unconditionally, so a 1-stone dead chain could
+    # mark a 38-stone Benson-alive chain dead via a shared empty cell.
+    rows = [
+        "W.W.WWbb.",
+        "WWWWWWWbb",
+        "W.WWWbbb.",
+        "WWWWbbb.b",
+        "WWWWWWbbb",
+        "bWbbbbb.b",
+        ".b.bbb.b.",
+        "bbbbb.b.b",
+        ".bb.bbbbb",
+    ]
+    def cell(ch):
+        return EMPTY if ch == "." else (BLACK if ch == "b" else WHITE)
+    b = [[cell(ch) for ch in row] for row in rows]
+
+    g = GoGame.from_position(b, to_move=BLACK)
+    alive_b = g._benson_alive(BLACK)
+    alive_w = g._benson_alive(WHITE)
+
+    # Benson should recognise the 38-stone chain and the lone H3 stone
+    # (which has four 1-cell vital regions) as alive; only the stranded
+    # A4 stone should be missing.
+    assert len(alive_b) == 2
+
+    db, dw = g._dead_chains(alive_b, alive_w)
+    # At most the lone A4 stone may be marked dead. Before the fix this
+    # was 40 (the entire black population).
+    assert len(db) <= 1
+    assert len(dw) == 0
+
+
 def test_score_dead_stones_removed_simple():
     # White group with no eyes enclosed by a Black group with two eyes.
     b = blank_board()

@@ -515,7 +515,11 @@ class GoGame:
                         visited.add(nidx)
                         queue.append(nidx)
                     elif nv == color:
-                        # Same-color chain: absorb it into our flood.
+                        # Skip alive allies — otherwise a dead chain
+                        # whose flood reaches a shared empty eye would
+                        # drag the alive ally into the dead set too.
+                        if ngid in alive_us:
+                            continue
                         if ngid not in visited_chains:
                             visited_chains.add(ngid)
                             for s in self._groups[ngid].stones:
