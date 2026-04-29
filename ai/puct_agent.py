@@ -98,6 +98,9 @@ def _add_dirichlet_noise(node: PUCTNode, rng: random.Random) -> None:
         ch.prior = (1.0 - _DIRICHLET_WEIGHT) * ch.prior + _DIRICHLET_WEIGHT * n
 
 
+_MAX_DESCENT_DEPTH = 60
+
+
 def run_puct_search(
     game: GoGame,
     predictor: Predictor,
@@ -106,6 +109,7 @@ def run_puct_search(
     root: Optional[PUCTNode] = None,
     add_root_noise: bool = False,
     rng: Optional[random.Random] = None,
+    max_descent_depth: int = _MAX_DESCENT_DEPTH,
 ) -> PUCTNode:
     if root is None:
         root = PUCTNode(to_play=game.to_move, prior=1.0)
@@ -120,7 +124,9 @@ def run_puct_search(
         path = [node]
 
         # Selection: descend while the current node has expanded children.
-        while node.expanded and node.children:
+        # Depth-capped so a single iteration's work stays bounded even when
+        # tree reuse has produced a deep persisted subtree.
+        while node.expanded and node.children and len(path) <= max_descent_depth:
             move, child = _select_child(node, c_puct=c_puct)
             if not sim.place_stone(*move):
                 # Illegal child (suicide/ko slipped through). Drop it and
@@ -138,9 +144,12 @@ def run_puct_search(
             leaf_value = 1.0 if winner == node.to_play else -1.0
         elif not node.expanded:
             leaf_value = _expand_node(node, sim, predictor)
-        else:
-            # Reached an expanded node with no legal children left after pruning.
+        elif not node.children:
+            # All children were pruned as illegal — forced loss for side to move.
             leaf_value = -1.0
+        else:
+            # Hit depth cap mid-descent on an already-expanded node.
+            leaf_value = 0.0
 
         # Backprop: each node stores value_sum from its OWN perspective.
         v = leaf_value
