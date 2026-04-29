@@ -41,7 +41,7 @@ import time
 from typing import Optional
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PYTHON = str(ROOT / ".venv" / "bin" / "python")
+PYTHON = sys.executable
 
 
 def _now() -> str:
