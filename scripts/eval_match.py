@@ -82,6 +82,9 @@ def _build_agent(spec: AgentSpec, seed: int):
             seed=seed,
             add_root_noise=True,
         )
+    if spec.engine == "gnugo":
+        from ai.gnugo_agent import GnuGoAgent
+        return GnuGoAgent(level=spec.iterations)
     return MCTSAgent(iterations=spec.iterations, seed=seed)
 
 
@@ -216,8 +219,8 @@ def main() -> None:
     p.add_argument("--b-name", default="B")
     p.add_argument("--a-iters", type=int, default=400)
     p.add_argument("--b-iters", type=int, default=400)
-    p.add_argument("--a-engine", choices=["mcts", "puct"], default="mcts")
-    p.add_argument("--b-engine", choices=["mcts", "puct"], default="mcts")
+    p.add_argument("--a-engine", choices=["mcts", "puct", "gnugo"], default="mcts")
+    p.add_argument("--b-engine", choices=["mcts", "puct", "gnugo"], default="mcts")
     p.add_argument("--a-model", type=str, default=None)
     p.add_argument("--b-model", type=str, default=None)
     p.add_argument("--csv", default=DEFAULT_CSV,
