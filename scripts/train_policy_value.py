@@ -80,20 +80,23 @@ def main() -> None:
         model.load_state_dict(state)
         print(f"initialized weights from {args.init_from}")
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Use AdamW with weight decay to prevent overfitting on small self-play datasets.
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     out_path = pathlib.Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _save(reason: str) -> None:
         torch.save({"state_dict": model.state_dict()}, out_path)
-        print(f"[{reason}] saved checkpoint to {out_path}")
+        print(f"[{reason}] saved checkpoint to {out_path}", flush=True)
 
     indices = list(range(n))
     try:
         for epoch in range(1, args.epochs + 1):
             random.shuffle(indices)
             epoch_loss = 0.0
+            epoch_p_loss = 0.0
+            epoch_v_loss = 0.0
             batches = 0
             for s in range(0, n, args.batch_size):
                 batch_idx = indices[s:s + args.batch_size]
@@ -107,7 +110,10 @@ def main() -> None:
 
                 logits, v_pred = model(x)
                 logp = torch.log_softmax(logits, dim=1)
+                
+                # Cross-entropy for policy
                 policy_loss = -(p_t * logp).sum(dim=1).mean()
+                # Mean Squared Error for value
                 value_loss = torch.mean((v_pred - v_t) ** 2)
                 loss = policy_loss + value_loss
 
@@ -116,9 +122,17 @@ def main() -> None:
                 opt.step()
 
                 epoch_loss += float(loss.item())
+                epoch_p_loss += float(policy_loss.item())
+                epoch_v_loss += float(value_loss.item())
                 batches += 1
 
-            print(f"epoch {epoch}/{args.epochs} loss={epoch_loss / max(1, batches):.5f}")
+            print(
+                f"epoch {epoch:2d}/{args.epochs} | "
+                f"loss={epoch_loss / batches:.4f} | "
+                f"p_loss={epoch_p_loss / batches:.4f} | "
+                f"v_loss={epoch_v_loss / batches:.4f}",
+                flush=True
+            )
             _save(f"epoch {epoch}")
     except KeyboardInterrupt:
         print("\nInterrupted — saving latest weights.")
