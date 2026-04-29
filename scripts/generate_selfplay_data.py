@@ -170,28 +170,46 @@ def main() -> None:
     ]
 
     print(f"Starting {args.workers} workers on {args.device}...", flush=True)
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    ctx = mp.get_context("spawn")
+    pool = ProcessPoolExecutor(
+        max_workers=args.workers,
+        mp_context=ctx,
+        initializer=_init_worker,
+        initargs=(args.predictor_checkpoint, args.device),
+    )
+    fut_to_idx = {pool.submit(_play_one_game, *t): t[0] for t in task_args}
+    skipped: list[int] = []
     try:
-        ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=args.workers, initializer=_init_worker,
-                      initargs=(args.predictor_checkpoint, args.device)) as pool:
-            for res in pool.imap_unordered(_play_one_game_wrapper, task_args, chunksize=1):
-                st, pol, val, moves, winner = res
-                states.append(st)
-                policies.append(pol)
-                values.append(val)
-                games_completed += 1
+        for fut in as_completed(fut_to_idx):
+            idx = fut_to_idx[fut]
+            try:
+                st, pol, val, moves, winner = fut.result()
+            except Exception as e:
+                print(f"[game {idx}] FAILED: {type(e).__name__}: {e}", flush=True)
+                skipped.append(idx)
+                continue
+            states.append(st)
+            policies.append(pol)
+            values.append(val)
+            games_completed += 1
 
-                elapsed = time.perf_counter() - started
-                eta = (args.games - games_completed) * (elapsed / games_completed) if games_completed > 0 else 0
-                print(f"[{games_completed}/{args.games}] samples={moves:3d} | winner={winner} | total={elapsed:6.1f}s | eta={eta:5.1f}s", flush=True)
+            elapsed = time.perf_counter() - started
+            eta = (args.games - games_completed) * (elapsed / games_completed) if games_completed > 0 else 0
+            print(f"[{games_completed}/{args.games}] game={idx} samples={moves:3d} | "
+                  f"winner={winner} | total={elapsed:6.1f}s | eta={eta:5.1f}s", flush=True)
 
-                if args.save_every > 0 and games_completed % args.save_every == 0:
-                    _flush("checkpoint")
+            if args.save_every > 0 and games_completed % args.save_every == 0:
+                _flush("checkpoint")
     except KeyboardInterrupt:
         print("\nInterrupted.")
         _flush("interrupted")
+        pool.shutdown(wait=False, cancel_futures=True)
         sys.exit(0)
 
+    pool.shutdown(wait=False, cancel_futures=True)
+    if skipped:
+        print(f"[done] skipped {len(skipped)} games: {sorted(skipped)}", flush=True)
     _flush("done")
 
 
