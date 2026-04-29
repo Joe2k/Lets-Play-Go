@@ -15,9 +15,17 @@ internal (r, c).
 
 Pass policy
 -----------
-Pass = concede in this assignment, so the Pass button uses a two-click
-confirmation: first click flips it to "Confirm pass = lose?" in red; a
-second click on the same button commits, any other click cancels.
+Two distinct sidebar buttons:
+
+- "Pass" calls GoGame.pass_turn(): a real pass that hands the turn to the
+  AI. Two consecutive passes end the game and trigger territory scoring.
+  No confirmation needed — passing is harmless under area scoring.
+- "End game" calls GoGame.concede(): an immediate forfeit. The human loses
+  regardless of board position. Two-click confirmation in red, since this
+  is destructive.
+
+When the AI's agent returns "pass", the engine's pass_turn() runs and the
+GUI waits for the human's reply.
 """
 
 from __future__ import annotations
@@ -146,12 +154,13 @@ class App:
         self.human_color = default_human_color
         self.state = START_SCREEN
         self.score_dict: Optional[dict] = None
-        self.confirm_pass = False
+        self.confirm_end = False
         self.illegal_msg: Optional[str] = None
         self.illegal_msg_time = 0
 
         self.pass_btn = Button((SIDEBAR_X, MARGIN + 330, 180, 40), "Pass")
-        self.new_btn = Button((SIDEBAR_X, MARGIN + 380, 180, 40), "New game")
+        self.end_btn = Button((SIDEBAR_X, MARGIN + 380, 180, 40), "End game")
+        self.new_btn = Button((SIDEBAR_X, MARGIN + 430, 180, 40), "New game")
 
         cx = WINDOW_W // 2
         cy = WINDOW_H // 2
@@ -201,26 +210,39 @@ class App:
         if self.state == GAME_OVER:
             if self.over_new_btn.hit(pos):
                 self.state = START_SCREEN
-                self.confirm_pass = False
+                self.confirm_end = False
             return
 
         if self.state != PLAYER_TURN:
             return
 
         if self.pass_btn.hit(pos):
-            if self.confirm_pass:
-                self.game.pass_turn()
+            # Real pass: hand the turn to the AI. Two consecutive passes
+            # (one from each side) end the game and trigger scoring.
+            self.confirm_end = False
+            self.game.pass_turn()
+            if self.game.finished:
                 self._end_game()
             else:
-                self.confirm_pass = True
+                self.state = AI_THINKING
+            return
+
+        if self.end_btn.hit(pos):
+            if self.confirm_end:
+                # "I give up" — concede ends the game with the human as
+                # the loser regardless of board position.
+                self.game.concede()
+                self._end_game()
+            else:
+                self.confirm_end = True
             return
 
         if self.new_btn.hit(pos):
             self.state = START_SCREEN
-            self.confirm_pass = False
+            self.confirm_end = False
             return
 
-        self.confirm_pass = False  # any other click cancels confirmation
+        self.confirm_end = False  # any other click cancels confirmation
         rc = xy_to_rc(*pos)
         if rc is None:
             return
@@ -242,7 +264,7 @@ class App:
         self.agent = self._build_agent()
         self.human_color = human_color
         self.score_dict = None
-        self.confirm_pass = False
+        self.confirm_end = False
         self.illegal_msg = None
         self.state = PLAYER_TURN if self.game.to_move == self.human_color else AI_THINKING
 
@@ -250,12 +272,16 @@ class App:
         move = self.agent.select_move(self.game)
         if move == "pass":
             self.game.pass_turn()
-            self._end_game()
+            if self.game.finished:
+                # Second consecutive pass ended the game — score it.
+                self._end_game()
+            else:
+                self.state = PLAYER_TURN
             return
         if not self.game.place_stone(*move):
             # Defensive: agent shouldn't return illegal moves, but if it
             # does, treat it as a forfeit rather than crashing.
-            self.game.pass_turn()
+            self.game.concede()
             self._end_game()
             return
         if self.game.finished:
@@ -266,7 +292,7 @@ class App:
     def _end_game(self) -> None:
         self.score_dict = self.game.score()
         self.state = GAME_OVER
-        self.confirm_pass = False
+        self.confirm_end = False
 
     # --- Rendering ---
 
@@ -410,15 +436,16 @@ class App:
 
         if self.state == PLAYER_TURN:
             mouse = pygame.mouse.get_pos()
-            if self.confirm_pass:
-                self.pass_btn.draw(
+            self.pass_btn.draw(self.screen, self.font, hover=self.pass_btn.hit(mouse))
+            if self.confirm_end:
+                self.end_btn.draw(
                     self.screen, self.small_font,
-                    hover=self.pass_btn.hit(mouse),
-                    override_text="Confirm pass = lose?",
+                    hover=self.end_btn.hit(mouse),
+                    override_text="Confirm: I give up?",
                     override_bg=BUTTON_DANGER_C,
                 )
             else:
-                self.pass_btn.draw(self.screen, self.font, hover=self.pass_btn.hit(mouse))
+                self.end_btn.draw(self.screen, self.font, hover=self.end_btn.hit(mouse))
             self.new_btn.draw(self.screen, self.font, hover=self.new_btn.hit(mouse))
 
     def _render_overlay(self, text: str) -> None:
