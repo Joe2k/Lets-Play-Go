@@ -215,6 +215,7 @@ def _gate_eval(
         "--csv", str(csv_path),
         "--gate-threshold", str(threshold),
         "--c-puct", str(c_puct),
+        "--add-noise",
     ]
     started = time.perf_counter()
     _run(cmd)
