@@ -163,6 +163,7 @@ def _train(
     batch_size: int,
     lr: float,
     device: str,
+    ownership_weight: float = 0.3,
 ) -> None:
     if out_path.exists() and state.gen(gen_idx).get("train_done"):
         print(f"[gen {gen_idx}] training already complete, skipping.")
@@ -175,6 +176,7 @@ def _train(
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--lr", str(lr),
+        "--ownership-weight", str(ownership_weight),
         "--out", str(out_path),
         "--device", device,
     ]
@@ -280,13 +282,13 @@ def main() -> None:
                    help="Self-play games per generation.")
     p.add_argument("--self-play-iters", type=int, default=400,
                    help="MCTS/PUCT iterations per move during self-play.")
-    p.add_argument("--self-play-fast-iters", type=int, default=50,
+    p.add_argument("--self-play-fast-iters", type=int, default=200,
                    help="MCTS/PUCT iterations for fast searches during self-play.")
-    p.add_argument("--self-play-full-search-fraction", type=float, default=0.25,
+    p.add_argument("--self-play-full-search-fraction", type=float, default=0.5,
                    help="Fraction of self-play turns that use the full iteration count.")
     p.add_argument("--self-play-pass-penalty", type=float, default=0.0,
                    help="Tiny penalty subtracted from pass move Q during self-play PUCT search.")
-    p.add_argument("--self-play-resign-threshold", type=float, default=0.9,
+    p.add_argument("--self-play-resign-threshold", type=float, default=0.95,
                    help="Resign when root Q falls below this during self-play.")
     p.add_argument("--self-play-resign-min-moves", type=int, default=30,
                    help="Minimum moves before resignation is allowed in self-play.")
@@ -294,7 +296,12 @@ def main() -> None:
                    help="Scale factor for score-margin value targets (0 = binary ±1).")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-3,
+                   help="Learning rate. When fine-tuning from a prior checkpoint, "
+                        "consider 3e-4 to avoid destabilizing the network.")
+    p.add_argument("--ownership-weight", type=float, default=0.3,
+                   help="Weight for ownership MSE loss term (default: 0.3). "
+                        "Lower this when the model is weak so policy/value get priority.")
     p.add_argument("--eval-games", type=int, default=40,
                    help="Games per gate-eval match. Below ~30 the win-rate "
                         "estimate is too noisy to gate at 0.55.")
@@ -384,7 +391,8 @@ def main() -> None:
                epochs=args.epochs,
                batch_size=args.batch_size,
                lr=args.lr,
-               device=args.device)
+               device=args.device,
+               ownership_weight=args.ownership_weight)
 
         promoted, win_rate = _gate_eval(
             state, gen, ckpt_path,
