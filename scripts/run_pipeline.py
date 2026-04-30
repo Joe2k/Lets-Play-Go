@@ -317,9 +317,12 @@ def main() -> None:
                    help="Train each generation on the last N self-play datasets "
                         "(sliding replay buffer). 1 = each gen sees only its own data.")
     p.add_argument("--c-puct", type=float, default=1.25,
-                   help="PUCT exploration constant for self-play AND gate eval. "
-                        "Lower = more exploitation; AlphaGo Zero used 1.25, "
-                        "KataGo ~1.1.")
+                   help="PUCT exploration constant for gate eval. "
+                        "Lower = more exploitation for accurate win-rate estimation.")
+    p.add_argument("--self-play-c-puct", type=float, default=1.5,
+                   help="PUCT exploration constant for self-play. "
+                        "Higher than eval (1.5 vs 1.25) because the model is weaker "
+                        "during search and needs more exploration to discover good moves.")
     p.add_argument("--workers", type=int, default=1,
                    help="Default worker count (used by both self-play and eval "
                         "unless overridden by --self-play-workers / --eval-workers).")
@@ -370,7 +373,7 @@ def main() -> None:
                    seed_base=args.seed_base,
                    workers=self_play_workers,
                    batch_size=self_play_batch,
-                   c_puct=args.c_puct,
+                   c_puct=args.self_play_c_puct,
                    fast_iters=args.self_play_fast_iters,
                    full_search_fraction=args.self_play_full_search_fraction,
                    pass_penalty=args.self_play_pass_penalty,
