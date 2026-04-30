@@ -116,6 +116,7 @@ def _self_play(
     c_puct: float = 1.25,
     fast_iters: int = 10,
     full_search_fraction: float = 0.25,
+    pass_penalty: float = 0.0,
 ) -> None:
     if out_path.exists() and state.gen(gen_idx).get("self_play_done"):
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
@@ -128,6 +129,7 @@ def _self_play(
         "--iterations", str(iterations),
         "--fast-iters", str(fast_iters),
         "--full-search-fraction", str(full_search_fraction),
+        "--pass-penalty", str(pass_penalty),
         "--seed", str(seed_base + 100 * gen_idx),
         "--output", str(out_path),
         "--device", device,
@@ -275,6 +277,8 @@ def main() -> None:
                    help="MCTS/PUCT iterations for fast searches during self-play.")
     p.add_argument("--self-play-full-search-fraction", type=float, default=0.25,
                    help="Fraction of self-play turns that use the full iteration count.")
+    p.add_argument("--self-play-pass-penalty", type=float, default=0.0,
+                   help="Tiny penalty subtracted from pass move Q during self-play PUCT search.")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -343,7 +347,8 @@ def main() -> None:
                    batch_size=self_play_batch,
                    c_puct=args.c_puct,
                    fast_iters=args.self_play_fast_iters,
-                   full_search_fraction=args.self_play_full_search_fraction)
+                   full_search_fraction=args.self_play_full_search_fraction,
+                   pass_penalty=args.self_play_pass_penalty)
 
         # Sliding replay window: train on the last `replay_window`
         # self-play datasets that actually exist on disk.

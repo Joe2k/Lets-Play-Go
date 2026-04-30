@@ -81,6 +81,7 @@ def _play_batch_games(
     predictor: Optional[PolicyValueModel] = None,
     fast_iterations: int = 10,
     full_search_fraction: float = 0.25,
+    pass_penalty: float = 0.0,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
     """Plays multiple games using batched MCTS and returns a list of game results."""
     results = []
@@ -150,6 +151,7 @@ def _play_batch_games(
                 roots=roots_to_search,
                 add_root_noise=add_root_noise,
                 rng=random.Random(active_seeds[0] if active_seeds else 0),
+                pass_penalty=pass_penalty,
             )
             # Additional iterations for games designated as full searches
             full_indices = [i for i, flag in enumerate(is_full_search) if flag]
@@ -164,6 +166,7 @@ def _play_batch_games(
                     roots=full_roots,
                     add_root_noise=False,  # noise already applied in fast search
                     rng=random.Random(active_seeds[0] if active_seeds else 0),
+                    pass_penalty=pass_penalty,
                 )
         else:
             for i in range(len(active_games)):
@@ -176,6 +179,7 @@ def _play_batch_games(
                     root=roots_to_search[i],
                     add_root_noise=add_root_noise,
                     rng=random.Random(active_seeds[i]),
+                    pass_penalty=pass_penalty,
                 )
         
         indices_to_remove = []
@@ -298,6 +302,8 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--c-puct", type=float, default=1.25,
                    help="Exploration constant for PUCT search.")
+    p.add_argument("--pass-penalty", type=float, default=0.0,
+                   help="Tiny penalty subtracted from pass move Q during PUCT selection (default: 0.0).")
     args = p.parse_args()
 
     out_path = pathlib.Path(args.output)
@@ -342,6 +348,7 @@ def main() -> None:
             predictor=predictor,
             fast_iterations=args.fast_iters,
             full_search_fraction=args.full_search_fraction,
+            pass_penalty=args.pass_penalty,
         )
         for st, pol, val, own, moves, winner, g_idx in results:
             states.append(st)
@@ -398,6 +405,7 @@ def main() -> None:
                 progress_queue=progress_queue,
                 fast_iterations=args.fast_iters,
                 full_search_fraction=args.full_search_fraction,
+                pass_penalty=args.pass_penalty,
             )
             for t in worker_tasks
         ]

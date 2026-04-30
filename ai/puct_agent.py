@@ -42,14 +42,18 @@ class Predictor(Protocol):
         ...
 
 
-def _select_child(node: PUCTNode, c_puct: float) -> tuple[Move, PUCTNode]:
+def _select_child(
+    node: PUCTNode,
+    c_puct: float,
+    pass_penalty: float = 0.0,
+) -> tuple[Move, PUCTNode]:
     parent_sqrt = math.sqrt(max(1, node.visit_count))
-    
+
     # First Play Urgency (FPU): Assign unvisited nodes the parent's Q value
     # instead of 0.0. This prevents the search from wasting iterations on
     # terrible moves when the parent position is already favorable.
     fpu_value = node.q if node.visit_count > 0 else 0.0
-    
+
     best_score = -1e18
     best_move: Optional[Move] = None
     best_child: Optional[PUCTNode] = None
@@ -57,10 +61,12 @@ def _select_child(node: PUCTNode, c_puct: float) -> tuple[Move, PUCTNode]:
         # child.q is from child.to_play's perspective; parent wants the child
         # whose position is worst for the child (i.e., best for parent).
         u = c_puct * child.prior * parent_sqrt / (1 + child.visit_count)
-        
+
         child_q = -child.q if child.visit_count > 0 else fpu_value
+        if move == PASS_MOVE:
+            child_q -= pass_penalty
         score = child_q + u
-        
+
         if score > best_score:
             best_score = score
             best_move = move
@@ -133,6 +139,7 @@ def run_puct_search(
     add_root_noise: bool = False,
     rng: Optional[random.Random] = None,
     max_descent_depth: int = _MAX_DESCENT_DEPTH,
+    pass_penalty: float = 0.0,
 ) -> PUCTNode:
     if root is None:
         root = PUCTNode(to_play=game.to_move, prior=1.0)
@@ -148,7 +155,7 @@ def run_puct_search(
 
         # Selection: descend while the current node has expanded children.
         while node.expanded and node.children and len(path) <= max_descent_depth:
-            move, child = _select_child(node, c_puct=c_puct)
+            move, child = _select_child(node, c_puct=c_puct, pass_penalty=pass_penalty)
             if not _try_apply_move(sim, move):
                 del node.children[move]
                 if not node.children:
@@ -189,6 +196,7 @@ def run_batched_puct_search(
     add_root_noise: bool = False,
     rng: Optional[random.Random] = None,
     max_descent_depth: int = _MAX_DESCENT_DEPTH,
+    pass_penalty: float = 0.0,
 ) -> list[PUCTNode]:
     """Run MCTS iterations for a batch of games in parallel, batching NN evaluations."""
     for i, root in enumerate(roots):
@@ -208,7 +216,7 @@ def run_batched_puct_search(
             path = paths[i]
 
             while node.expanded and node.children and len(path) <= max_descent_depth:
-                move, child = _select_child(node, c_puct=c_puct)
+                move, child = _select_child(node, c_puct=c_puct, pass_penalty=pass_penalty)
                 if not _try_apply_move(sim, move):
                     del node.children[move]
                     if not node.children:
@@ -263,10 +271,12 @@ class PUCTAgent:
         seed: Optional[int] = None,
         device: str = "cpu",
         add_root_noise: bool = False,
+        pass_penalty: float = 0.0,
     ) -> None:
         require_torch()
         self.iterations = iterations
         self.c_puct = c_puct
+        self.pass_penalty = pass_penalty
         self._rng = random.Random(seed)
         self.model = PolicyValueModel(model_path=model_path, device=device)
         self.add_root_noise = add_root_noise
@@ -288,6 +298,7 @@ class PUCTAgent:
             root=self._root,
             add_root_noise=self.add_root_noise,
             rng=self._rng,
+            pass_penalty=self.pass_penalty,
         )
         if not self._root.children:
             return PASS_MOVE
