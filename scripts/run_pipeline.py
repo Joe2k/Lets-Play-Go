@@ -284,12 +284,28 @@ def main() -> None:
                         "Lower = more exploitation; AlphaGo Zero used 1.25, "
                         "KataGo ~1.1.")
     p.add_argument("--workers", type=int, default=1,
-                   help="Parallel workers for self-play data generation.")
+                   help="Default worker count (used by both self-play and eval "
+                        "unless overridden by --self-play-workers / --eval-workers).")
+    p.add_argument("--self-play-workers", type=int, default=None,
+                   help="Workers for self-play data generation. Defaults to --workers. "
+                        "On a single GPU prefer few workers (1-2) with a large batch; "
+                        "GPU utilization comes from --self-play-batch-size, not workers.")
+    p.add_argument("--eval-workers", type=int, default=None,
+                   help="Workers for gate eval. Defaults to --workers. Eval games run "
+                        "independently with no cross-batching, so more workers ~= more "
+                        "throughput up to your CPU/GPU limit.")
+    p.add_argument("--self-play-batch-size", type=int, default=None,
+                   help="Concurrent games per self-play worker (lockstep batched MCTS). "
+                        "Defaults to --batch-size. Larger = more GPU saturation per worker.")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--seed-base", type=int, default=0)
     args = p.parse_args()
     if args.replay_window < 1:
         raise SystemExit("--replay-window must be >= 1")
+
+    self_play_workers = args.self_play_workers if args.self_play_workers is not None else args.workers
+    eval_workers = args.eval_workers if args.eval_workers is not None else args.workers
+    self_play_batch = args.self_play_batch_size if args.self_play_batch_size is not None else args.batch_size
 
     run_dir = pathlib.Path(args.run_dir)
     data_dir = run_dir / "data"
@@ -315,8 +331,8 @@ def main() -> None:
                    iterations=args.self_play_iters,
                    device=args.device,
                    seed_base=args.seed_base,
-                   workers=args.workers,
-                   batch_size=args.batch_size,
+                   workers=self_play_workers,
+                   batch_size=self_play_batch,
                    c_puct=args.c_puct)
 
         # Sliding replay window: train on the last `replay_window`
@@ -342,7 +358,7 @@ def main() -> None:
             threshold=args.gate_threshold,
             csv_path=eval_csv,
             c_puct=args.c_puct,
-            workers=args.workers
+            workers=eval_workers,
         )
 
         if promoted:

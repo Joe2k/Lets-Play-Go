@@ -9,6 +9,7 @@ Outputs a torch checkpoint dict with:
 from __future__ import annotations
 
 import argparse
+import io
 import multiprocessing as mp
 import os
 import pathlib
@@ -159,10 +160,14 @@ def _play_batch_games(
                 val_tensor = torch.tensor(v_list, dtype=torch.float32) if v_list else torch.empty((0,), dtype=torch.float32)
                 
                 res = (st_tensor, pol_tensor, val_tensor, len(p_list), winner, g_idx)
-                results.append(res)
                 if progress_queue is not None:
-                    progress_queue.put(res)
+                    # Serialize to bytes so the queue doesn't go through torch's
+                    # FD-based shared-memory reducer (which exhausts FDs on long runs).
+                    buf = io.BytesIO()
+                    torch.save(res, buf)
+                    progress_queue.put(buf.getvalue())
                 else:
+                    results.append(res)
                     # In single-worker mode without a queue, print progress immediately
                     print(f"  -> Game {g_idx} finished in {len(p_list)} moves (winner: {winner})", flush=True)
                 indices_to_remove.append(i)
@@ -206,6 +211,25 @@ def _play_batch_games(
     return results
 
 
+def _format_eta(games_done: int, games_total: int, elapsed: float, first_completion_at: float) -> str:
+    """ETA computed from the post-warmup finish rate.
+
+    Lockstep batched MCTS finishes its first wave of ~batch_size games near-simultaneously,
+    so dividing total elapsed by games_done gives a wildly pessimistic early estimate.
+    Use the rate observed *after* the first completion instead.
+    """
+    if games_done <= 1:
+        return "  warmup"
+    post_warmup = elapsed - first_completion_at
+    if post_warmup <= 0:
+        return "  warmup"
+    rate = (games_done - 1) / post_warmup  # games per second, steady-state
+    remaining = games_total - games_done
+    if rate <= 0:
+        return "    n/a"
+    return f"{remaining / rate:6.1f}s"
+
+
 def main() -> None:
     require_torch()
     p = argparse.ArgumentParser(description="Generate PUCT self-play dataset")
@@ -241,7 +265,8 @@ def main() -> None:
 
     started = time.perf_counter()
     games_completed = 0
-    
+    first_completion_at: Optional[float] = None  # elapsed when game 1 finishes
+
     if args.workers == 1:
         print(f"Starting 1 worker on {args.device} (batch_size={args.batch_size})...", flush=True)
         predictor = None
@@ -270,9 +295,11 @@ def main() -> None:
             values.append(val)
             games_completed += 1
             elapsed = time.perf_counter() - started
-            eta = (args.games - games_completed) * (elapsed / games_completed)
+            if first_completion_at is None:
+                first_completion_at = elapsed
+            eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
             print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
-                  f"winner={winner} | total={elapsed:6.1f}s | eta={eta:5.1f}s", flush=True)
+                  f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
             if args.save_every > 0 and games_completed % args.save_every == 0:
                 _flush("checkpoint")
     else:
@@ -315,16 +342,19 @@ def main() -> None:
         try:
             while games_completed < args.games:
                 try:
-                    res = progress_queue.get(timeout=1.0)
+                    payload = progress_queue.get(timeout=1.0)
+                    res = torch.load(io.BytesIO(payload), weights_only=False)
                     st, pol, val, moves, winner, g_idx = res
                     states.append(st)
                     policies.append(pol)
                     values.append(val)
                     games_completed += 1
                     elapsed = time.perf_counter() - started
-                    eta = (args.games - games_completed) * (elapsed / games_completed)
+                    if first_completion_at is None:
+                        first_completion_at = elapsed
+                    eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
                     print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
-                          f"winner={winner} | total={elapsed:6.1f}s | eta={eta:5.1f}s", flush=True)
+                          f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
                     if args.save_every > 0 and games_completed % args.save_every == 0:
                         _flush("checkpoint")
                 except queue.Empty:
