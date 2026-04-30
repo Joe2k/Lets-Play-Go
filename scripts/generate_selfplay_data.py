@@ -1,8 +1,8 @@
 """Generate self-play training data using PUCT visit targets.
 
 Outputs a torch checkpoint dict with:
-- states: [N, 3, 9, 9] float tensor
-- policy: [N, 81] float tensor
+- states: [N, INPUT_PLANES, 9, 9] float tensor
+- policy: [N, POLICY_SIZE] float tensor (board moves + pass slot)
 - value:  [N] float tensor in {-1, +1}
 """
 
@@ -25,19 +25,27 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ai.model import PolicyValueModel, encode_game_tensor, require_torch, torch
-from ai.puct_agent import PUCTNode, run_puct_search, run_batched_puct_search
-from engine.go_engine import GoGame
+from ai.model import (
+    INPUT_PLANES,
+    PASS_INDEX,
+    POLICY_SIZE,
+    PolicyValueModel,
+    encode_game_tensor,
+    require_torch,
+    torch,
+)
+from ai.puct_agent import PASS_MOVE, PUCTNode, run_puct_search, run_batched_puct_search
+from engine.go_engine import SIZE, GoGame
 
 
 class _UniformPredictor:
     """Uniform prior + zero value bootstrap predictor."""
 
     def predict(self, game: GoGame) -> tuple[list[float], float]:
-        return [1.0 / 81.0] * 81, 0.0
+        return [1.0 / POLICY_SIZE] * POLICY_SIZE, 0.0
 
 
-def _sample_from_visits(visits: dict[tuple[int, int], int], rng: random.Random, temperature: float) -> tuple[int, int]:
+def _sample_from_visits(visits: dict, rng: random.Random, temperature: float):
     items = list(visits.items())
     if temperature <= 1e-6:
         return max(items, key=lambda kv: kv[1])[0]
@@ -155,8 +163,8 @@ def _play_batch_games(
                 p_list = game_players[i]
                 v_list = [1.0 if p == winner else -1.0 for p in p_list]
                 
-                st_tensor = torch.stack(game_states[i]) if game_states[i] else torch.empty((0, 3, 9, 9), dtype=torch.float32)
-                pol_tensor = torch.stack(game_policies[i]) if game_policies[i] else torch.empty((0, 81), dtype=torch.float32)
+                st_tensor = torch.stack(game_states[i]) if game_states[i] else torch.empty((0, INPUT_PLANES, SIZE, SIZE), dtype=torch.float32)
+                pol_tensor = torch.stack(game_policies[i]) if game_policies[i] else torch.empty((0, POLICY_SIZE), dtype=torch.float32)
                 val_tensor = torch.tensor(v_list, dtype=torch.float32) if v_list else torch.empty((0,), dtype=torch.float32)
                 
                 res = (st_tensor, pol_tensor, val_tensor, len(p_list), winner, g_idx)
@@ -173,30 +181,33 @@ def _play_batch_games(
                 indices_to_remove.append(i)
                 continue
                 
-            pol = torch.zeros(81, dtype=torch.float32)
-            visits = {}
+            pol = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+            visits: dict = {}
             for move, ch in root.children.items():
                 v = ch.visit_count
                 visits[move] = v
-                pol[move[0] * 9 + move[1]] = float(v) / float(visit_sum)
-                
+                if move == PASS_MOVE:
+                    pol[PASS_INDEX] = float(v) / float(visit_sum)
+                else:
+                    pol[move[0] * SIZE + move[1]] = float(v) / float(visit_sum)
+
             st = encode_game_tensor(game)[0].cpu()
             game_states[i].append(st)
             game_policies[i].append(pol)
             game_players[i].append(game.to_move)
-            
+
             rng = random.Random(active_seeds[i] + len(game_states[i]))
             temp = temperature if len(game_states[i]) < 20 else max(0.05, temperature * 0.25)
             mv = _sample_from_visits(visits, rng, temp)
-            
-            if not game.place_stone(*mv):
+
+            if mv == PASS_MOVE:
+                game.pass_turn()
+                active_roots[i] = root.children.get(mv)
+            elif not game.place_stone(*mv):
                 game.pass_turn()
                 active_roots[i] = None
             else:
-                if mv in root.children:
-                    active_roots[i] = root.children[mv]
-                else:
-                    active_roots[i] = None
+                active_roots[i] = root.children.get(mv)
                 
         for idx in reversed(indices_to_remove):
             active_games.pop(idx)
@@ -256,8 +267,8 @@ def main() -> None:
 
     def _flush(reason: str) -> None:
         blob = {
-            "states": torch.cat(states) if states else torch.empty((0, 3, 9, 9), dtype=torch.float32),
-            "policy": torch.cat(policies) if policies else torch.empty((0, 81), dtype=torch.float32),
+            "states": torch.cat(states) if states else torch.empty((0, INPUT_PLANES, SIZE, SIZE), dtype=torch.float32),
+            "policy": torch.cat(policies) if policies else torch.empty((0, POLICY_SIZE), dtype=torch.float32),
             "value": torch.cat(values) if values else torch.empty((0,), dtype=torch.float32),
         }
         torch.save(blob, out_path)

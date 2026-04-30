@@ -7,12 +7,13 @@ import random
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, Union
 
-from engine.go_engine import BLACK, WHITE, GoGame
+from engine.go_engine import BLACK, SIZE, WHITE, GoGame
 
-from .mcts import candidate_moves, tactical_override_move
-from .model import PolicyValueModel, require_torch
+from .mcts import candidate_moves
+from .model import PASS_INDEX, PolicyValueModel, require_torch
 
 Move = Union[tuple[int, int], str]
+PASS_MOVE: str = "pass"
 
 _DIRICHLET_ALPHA = 0.03
 _DIRICHLET_WEIGHT = 0.25
@@ -24,7 +25,7 @@ class PUCTNode:
     prior: float = 0.0
     visit_count: int = 0
     value_sum: float = 0.0
-    children: dict[tuple[int, int], "PUCTNode"] = field(default_factory=dict)
+    children: dict[Move, "PUCTNode"] = field(default_factory=dict)
     expanded: bool = False
 
     @property
@@ -41,11 +42,11 @@ class Predictor(Protocol):
         ...
 
 
-def _select_child(node: PUCTNode, c_puct: float) -> tuple[tuple[int, int], PUCTNode]:
+def _select_child(node: PUCTNode, c_puct: float) -> tuple[Move, PUCTNode]:
     parent_sqrt = math.sqrt(max(1, node.visit_count))
     best_score = -1e18
-    best_move = None
-    best_child = None
+    best_move: Optional[Move] = None
+    best_child: Optional[PUCTNode] = None
     for move, child in node.children.items():
         # child.q is from child.to_play's perspective; parent wants the child
         # whose position is worst for the child (i.e., best for parent).
@@ -59,6 +60,14 @@ def _select_child(node: PUCTNode, c_puct: float) -> tuple[tuple[int, int], PUCTN
     return best_move, best_child
 
 
+def _try_apply_move(sim: GoGame, move: Move) -> bool:
+    """Apply `move` to `sim`. Returns whether the move was legal."""
+    if move == PASS_MOVE:
+        sim.pass_turn()
+        return True
+    return sim.place_stone(*move)
+
+
 def _expand_node(node: PUCTNode, game: GoGame, predictor: Predictor) -> float:
     probs, value = predictor.predict(game)
     _expand_node_from_data(node, game, probs)
@@ -67,18 +76,20 @@ def _expand_node(node: PUCTNode, game: GoGame, predictor: Predictor) -> float:
 
 def _expand_node_from_data(node: PUCTNode, game: GoGame, probs: list[float]) -> None:
     legal_moves = candidate_moves(game)
-    if not legal_moves:
-        node.expanded = True
-        return
 
-    priors: list[tuple[tuple[int, int], float]] = []
+    priors: list[tuple[Move, float]] = []
     total = 0.0
     for r, c in legal_moves:
-        p = probs[r * 9 + c]
+        p = probs[r * SIZE + c]
         priors.append(((r, c), p))
         total += p
+    # Pass is always a legal action.
+    pass_prior = probs[PASS_INDEX] if len(probs) > PASS_INDEX else 0.0
+    priors.append((PASS_MOVE, pass_prior))
+    total += pass_prior
+
     if total <= 1e-12:
-        total = float(len(legal_moves))
+        total = float(len(priors))
         priors = [(m, 1.0) for m, _ in priors]
     node.children = {
         move: PUCTNode(to_play=_other(node.to_play), prior=(p / total))
@@ -91,7 +102,6 @@ def _add_dirichlet_noise(node: PUCTNode, rng: random.Random) -> None:
     if not node.children:
         return
     moves = list(node.children.keys())
-    # Sample Dirichlet(alpha) via independent Gammas (k=alpha, theta=1).
     samples = [rng.gammavariate(_DIRICHLET_ALPHA, 1.0) for _ in moves]
     s = sum(samples)
     if s <= 0:
@@ -130,13 +140,15 @@ def run_puct_search(
         # Selection: descend while the current node has expanded children.
         while node.expanded and node.children and len(path) <= max_descent_depth:
             move, child = _select_child(node, c_puct=c_puct)
-            if not sim.place_stone(*move):
+            if not _try_apply_move(sim, move):
                 del node.children[move]
                 if not node.children:
                     break
                 continue
             node = child
             path.append(node)
+            if sim.finished:
+                break
 
         # Evaluate leaf
         if sim.finished:
@@ -170,7 +182,6 @@ def run_batched_puct_search(
     max_descent_depth: int = _MAX_DESCENT_DEPTH,
 ) -> list[PUCTNode]:
     """Run MCTS iterations for a batch of games in parallel, batching NN evaluations."""
-    # Ensure roots are initialized
     for i, root in enumerate(roots):
         if not root.expanded:
             _expand_node(root, games[i], model)
@@ -178,7 +189,6 @@ def run_batched_puct_search(
             _add_dirichlet_noise(root, rng or random.Random())
 
     for _ in range(iterations):
-        # 1. Selection & Descent
         sims = [g.clone_fast() for g in games]
         paths = [[r] for r in roots]
         leaf_nodes: list[PUCTNode] = []
@@ -190,16 +200,17 @@ def run_batched_puct_search(
 
             while node.expanded and node.children and len(path) <= max_descent_depth:
                 move, child = _select_child(node, c_puct=c_puct)
-                if not sim.place_stone(*move):
+                if not _try_apply_move(sim, move):
                     del node.children[move]
                     if not node.children:
                         break
                     continue
                 node = child
                 path.append(node)
+                if sim.finished:
+                    break
             leaf_nodes.append(node)
 
-        # 2. Evaluation
         to_predict_indices = []
         to_predict_sims = []
         leaf_values = [0.0] * len(games)
@@ -216,7 +227,6 @@ def run_batched_puct_search(
             else:
                 leaf_values[i] = 0.0
 
-        # Batch Prediction
         if to_predict_sims:
             probs_list, values = model.predict_batch(to_predict_sims)
             for i, idx in enumerate(to_predict_indices):
@@ -225,7 +235,6 @@ def run_batched_puct_search(
                 _expand_node_from_data(node, sim, probs_list[i])
                 leaf_values[idx] = values[i]
 
-        # 3. Backpropagation
         for i in range(len(games)):
             v = leaf_values[i]
             for p in reversed(paths[i]):
@@ -260,16 +269,6 @@ class PUCTAgent:
         self._last_to_play = None
 
     def select_move(self, game: GoGame) -> Move:
-        cands = candidate_moves(game)
-        if not cands:
-            self._root = None
-            return "pass"
-
-        tactical = tactical_override_move(game)
-        if tactical is not None:
-            self._root = None
-            return tactical
-
         self._advance_root_to(game)
 
         self._root = run_puct_search(
@@ -282,7 +281,7 @@ class PUCTAgent:
             rng=self._rng,
         )
         if not self._root.children:
-            return "pass"
+            return PASS_MOVE
         best = max(self._root.children.items(), key=lambda kv: kv[1].visit_count)[0]
         # Promote chosen child to next root for tree reuse.
         self._root = self._root.children[best]
@@ -296,8 +295,13 @@ class PUCTAgent:
             self._last_to_play = None
             return
         last = game.last_move
-        if isinstance(last, tuple) and last in self._root.children:
-            self._root = self._root.children[last]
+        key: Optional[Move] = None
+        if isinstance(last, tuple):
+            key = last
+        elif last == "pass":
+            key = PASS_MOVE
+        if key is not None and key in self._root.children:
+            self._root = self._root.children[key]
             self._last_to_play = game.to_move
             return
         # Mismatch — discard and rebuild fresh.

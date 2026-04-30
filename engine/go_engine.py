@@ -18,6 +18,7 @@ EMPTY = 0
 BLACK = 1
 WHITE = 2
 KOMI = 2.5
+HISTORY_DEPTH = 2  # number of pre-move board snapshots kept for NN input planes
 _NEIGHBOR_OFFSETS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
@@ -45,6 +46,10 @@ class GoGame:
         self.history: list[tuple[int, int] | str] = []
         self.finished: bool = False
         self.loser: Optional[int] = None
+        # Pre-move board snapshots, ordered most-recent-first, capped at
+        # HISTORY_DEPTH. Used by the NN encoder to build history planes;
+        # carried by clone_fast so MCTS leaf evaluations see correct history.
+        self.prev_boards: list[list[int]] = []
         self._gid_by_idx: list[int] = [-1] * (SIZE * SIZE)
         self._groups: dict[int, _GroupCache] = {}
         self._next_gid: int = 0
@@ -65,6 +70,7 @@ class GoGame:
         g.history = self.history.copy()
         g.finished = self.finished
         g.loser = self.loser
+        g.prev_boards = [b.copy() for b in self.prev_boards]
         g._gid_by_idx = self._gid_by_idx.copy()
         g._groups = {
             gid: _GroupCache(gr.color, gr.stones.copy(), gr.liberties.copy())
@@ -153,6 +159,9 @@ class GoGame:
             return False
 
         self.prev_position = pre_move
+        self.prev_boards.insert(0, list(pre_move))
+        if len(self.prev_boards) > HISTORY_DEPTH:
+            self.prev_boards = self.prev_boards[:HISTORY_DEPTH]
         self.captures[me] += captured
         self.last_move = (row, col)
         self.history.append((row, col))
@@ -177,6 +186,11 @@ class GoGame:
         This allows GNU Go to finish naturally and be scored correctly."""
         if self.finished:
             return
+        # Pass doesn't change the board, but it advances time — push a
+        # snapshot so history planes shift correctly.
+        self.prev_boards.insert(0, self.board.copy())
+        if len(self.prev_boards) > HISTORY_DEPTH:
+            self.prev_boards = self.prev_boards[:HISTORY_DEPTH]
         if self.last_move == "pass":
             self.finished = True
         self.last_move = "pass"
@@ -266,6 +280,7 @@ class GoGame:
         g.board = [board[r][c] for r in range(SIZE) for c in range(SIZE)]
         g._groups_dirty = True
         g.to_move = to_move
+        g.prev_boards = []
         if prev_position is not None:
             if len(prev_position) != SIZE or any(len(row) != SIZE for row in prev_position):
                 raise ValueError(f"prev_position must be {SIZE}x{SIZE}")

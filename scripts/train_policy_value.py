@@ -16,32 +16,37 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ai.model import TinyPolicyValueNet, require_torch, torch
+from ai.model import POLICY_SIZE, TinyPolicyValueNet, require_torch, torch
 from engine.go_engine import SIZE
 
 
 def _augment_batch(states: "torch.Tensor", policy: "torch.Tensor"):
     """Return (states_aug, policy_aug) with 8x samples via dihedral symmetries.
 
-    states: [B, C, H, W]; policy: [B, H*W].
+    states: [B, C, H, W]; policy: [B, POLICY_SIZE] = [B, H*W + 1] (last col = pass).
+    Pass is invariant under board symmetries; only the H*W board slice rotates.
     """
     B, C, H, W = states.shape
     assert H == W == SIZE
-    pol_2d = policy.view(B, H, W)
+    assert policy.shape[1] == POLICY_SIZE
+    pol_board = policy[:, :H * W].view(B, H, W)
+    pol_pass = policy[:, H * W:]  # [B, 1]
 
     aug_s = []
     aug_p = []
     for k in range(4):
         s_rot = torch.rot90(states, k=k, dims=(2, 3))
-        p_rot = torch.rot90(pol_2d, k=k, dims=(1, 2))
+        p_rot = torch.rot90(pol_board, k=k, dims=(1, 2))
         aug_s.append(s_rot)
-        aug_p.append(p_rot)
+        aug_p.append(torch.cat([p_rot.reshape(B, H * W), pol_pass], dim=1))
         # Horizontal flip on top of rotation = the 4 reflective members.
         aug_s.append(torch.flip(s_rot, dims=(3,)))
-        aug_p.append(torch.flip(p_rot, dims=(2,)))
+        aug_p.append(
+            torch.cat([torch.flip(p_rot, dims=(2,)).reshape(B, H * W), pol_pass], dim=1)
+        )
 
     s_out = torch.cat(aug_s, dim=0)
-    p_out = torch.cat(aug_p, dim=0).reshape(8 * B, H * W)
+    p_out = torch.cat(aug_p, dim=0)
     return s_out, p_out
 
 
