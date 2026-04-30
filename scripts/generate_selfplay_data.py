@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import os
 import pathlib
 import queue
 import random
 import sys
 import time
 from typing import Optional
+
+os.environ["OMP_NUM_THREADS"] = "1"
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

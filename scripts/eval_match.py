@@ -27,10 +27,14 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import os
 import pathlib
 import statistics
 import sys
 import time
+
+os.environ["OMP_NUM_THREADS"] = "1"
+
 from dataclasses import dataclass, field
 from typing import Optional
 
