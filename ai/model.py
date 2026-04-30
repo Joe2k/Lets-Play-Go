@@ -66,7 +66,7 @@ if torch_available():
             return torch.relu(out)
 
     class TinyPolicyValueNet(nn.Module):
-        def __init__(self, channels: int = 96, num_blocks: int = 8) -> None:
+        def __init__(self, channels: int = 64, num_blocks: int = 4) -> None:
             super().__init__()
             self.start_conv = nn.Sequential(
                 nn.Conv2d(INPUT_PLANES, channels, kernel_size=3, padding=1, bias=False),
@@ -112,7 +112,7 @@ if torch_available():
             return policy_logits, value, ownership
 else:
     class TinyPolicyValueNet:  # pragma: no cover
-        def __init__(self, channels: int = 96, num_blocks: int = 8) -> None:
+        def __init__(self, channels: int = 64, num_blocks: int = 4) -> None:
             raise RuntimeError("PyTorch is required for TinyPolicyValueNet.")
 
 
