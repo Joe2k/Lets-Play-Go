@@ -254,6 +254,59 @@ class GoGame:
             "winner": winner,
         }
 
+    def ownership_map(self) -> list[float]:
+        """Return length-81 ownership from Black's perspective.
+
+        +1.0 = Black owns the point, -1.0 = White owns, 0.0 = neutral/dame.
+        Uses dead-stone removal when the game ended via two passes.
+        """
+        if self.finished and self.loser is None:
+            self._ensure_groups()
+            alive_b = self._benson_alive(BLACK)
+            alive_w = self._benson_alive(WHITE)
+            dead_b, dead_w = self._dead_chains(alive_b, alive_w)
+            board = list(self.board)
+            for s in dead_b | dead_w:
+                board[s] = EMPTY
+        else:
+            board = self.board
+
+        visited = [False] * (SIZE * SIZE)
+        owner = [0.0] * (SIZE * SIZE)
+
+        for i in range(SIZE * SIZE):
+            if board[i] == BLACK:
+                owner[i] = 1.0
+            elif board[i] == WHITE:
+                owner[i] = -1.0
+
+        for start in range(SIZE * SIZE):
+            if visited[start] or board[start] != EMPTY:
+                continue
+            region: list[int] = []
+            borders: set[int] = set()
+            queue = deque([start])
+            visited[start] = True
+            while queue:
+                idx = queue.popleft()
+                region.append(idx)
+                for nidx in self._neighbors_of(idx):
+                    v = board[nidx]
+                    if v == EMPTY:
+                        if not visited[nidx]:
+                            visited[nidx] = True
+                            queue.append(nidx)
+                    else:
+                        borders.add(v)
+            val = 0.0
+            if borders == {BLACK}:
+                val = 1.0
+            elif borders == {WHITE}:
+                val = -1.0
+            for idx in region:
+                owner[idx] = val
+        return owner
+
     # ---------- test-only constructor ----------
 
     @classmethod

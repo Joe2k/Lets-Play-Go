@@ -33,6 +33,9 @@ INPUT_PLANES = 8
 POLICY_SIZE = SIZE * SIZE + 1
 PASS_INDEX = SIZE * SIZE
 
+# Ownership: one scalar per board point.
+OWNERSHIP_SIZE = SIZE * SIZE
+
 
 def torch_available() -> bool:
     return torch is not None and nn is not None
@@ -92,12 +95,21 @@ if torch_available():
                 nn.Tanh(),
             )
 
-        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            self.ownership_head = nn.Sequential(
+                nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+                nn.BatchNorm2d(1),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Tanh(),
+            )
+
+        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             h = self.start_conv(x)
             h = self.res_tower(h)
             policy_logits = self.policy_head(h)
             value = self.value_head(h).squeeze(-1)
-            return policy_logits, value
+            ownership = self.ownership_head(h)
+            return policy_logits, value, ownership
 else:
     class TinyPolicyValueNet:  # pragma: no cover
         def __init__(self, channels: int = 96, num_blocks: int = 8) -> None:
@@ -179,7 +191,11 @@ class PolicyValueModel:
         if model_path:
             ckpt = torch.load(model_path, map_location=self.device, weights_only=True)
             state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-            self.net.load_state_dict(state)
+            missing, unexpected = self.net.load_state_dict(state, strict=False)
+            if missing:
+                print(f"Warning: missing keys when loading checkpoint: {missing}")
+            if unexpected:
+                print(f"Warning: unexpected keys when loading checkpoint: {unexpected}")
 
     def predict(self, game: GoGame) -> tuple[list[float], float]:
         probs_list, values = self.predict_batch([game])
@@ -190,7 +206,7 @@ class PolicyValueModel:
             return [], []
         with torch.no_grad():
             x = encode_games_batch(games, device=self.device)
-            logits, values = self.net(x)
+            logits, values, _ownership = self.net(x)
             probs = torch.softmax(logits, dim=1).cpu().tolist()
             vs = values.cpu().tolist()
         return probs, vs

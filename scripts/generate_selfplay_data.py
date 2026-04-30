@@ -4,6 +4,7 @@ Outputs a torch checkpoint dict with:
 - states: [N, INPUT_PLANES, 9, 9] float tensor
 - policy: [N, POLICY_SIZE] float tensor (board moves + pass slot)
 - value:  [N] float tensor in {-1, +1}
+- ownership: [N, 81] float tensor in {-1, +1} from side-to-move perspective
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from ai.model import (
     torch,
 )
 from ai.puct_agent import PASS_MOVE, PUCTNode, run_puct_search, run_batched_puct_search
-from engine.go_engine import SIZE, GoGame
+from engine.go_engine import BLACK, SIZE, WHITE, GoGame
 
 
 class _UniformPredictor:
@@ -80,19 +81,20 @@ def _play_batch_games(
     predictor: Optional[PolicyValueModel] = None,
     fast_iterations: int = 10,
     full_search_fraction: float = 0.25,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
     """Plays multiple games using batched MCTS and returns a list of game results."""
     results = []
-    
+
     active_games: list[GoGame] = []
     active_roots: list[Optional[PUCTNode]] = []
     active_seeds: list[int] = []
     active_indices: list[int] = []
-    
+
     game_states: list[list[torch.Tensor]] = []
     game_policies: list[list[torch.Tensor]] = []
     game_players: list[list[int]] = []
-    
+    game_ownerships: list[list[torch.Tensor]] = []
+
     next_idx_to_start = 0
     
     current_predictor = predictor or _worker_predictor
@@ -112,7 +114,8 @@ def _play_batch_games(
         game_states.append([])
         game_policies.append([])
         game_players.append([])
-        
+        game_ownerships.append([])
+
         next_idx_to_start += 1
         return True
 
@@ -186,12 +189,19 @@ def _play_batch_games(
                 winner = game.score()["winner"]
                 p_list = game_players[i]
                 v_list = [1.0 if p == winner else -1.0 for p in p_list]
-                
+
+                abs_owner = game.ownership_map()
+                own_list = []
+                for p in p_list:
+                    mult = 1.0 if p == BLACK else -1.0
+                    own_list.append(torch.tensor([mult * v for v in abs_owner], dtype=torch.float32))
+
                 st_tensor = torch.stack(game_states[i]) if game_states[i] else torch.empty((0, INPUT_PLANES, SIZE, SIZE), dtype=torch.float32)
                 pol_tensor = torch.stack(game_policies[i]) if game_policies[i] else torch.empty((0, POLICY_SIZE), dtype=torch.float32)
                 val_tensor = torch.tensor(v_list, dtype=torch.float32) if v_list else torch.empty((0,), dtype=torch.float32)
-                
-                res = (st_tensor, pol_tensor, val_tensor, len(p_list), winner, g_idx)
+                own_tensor = torch.stack(own_list) if own_list else torch.empty((0, SIZE * SIZE), dtype=torch.float32)
+
+                res = (st_tensor, pol_tensor, val_tensor, own_tensor, len(p_list), winner, g_idx)
                 if progress_queue is not None:
                     # Serialize to bytes so the queue doesn't go through torch's
                     # FD-based shared-memory reducer (which exhausts FDs on long runs).
@@ -241,6 +251,7 @@ def _play_batch_games(
             game_states.pop(idx)
             game_policies.pop(idx)
             game_players.pop(idx)
+            game_ownerships.pop(idx)
             start_game()
             
     return results
@@ -292,13 +303,14 @@ def main() -> None:
     out_path = pathlib.Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    states, policies, values = [], [], []
+    states, policies, values, ownerships = [], [], [], []
 
     def _flush(reason: str) -> None:
         blob = {
             "states": torch.cat(states) if states else torch.empty((0, INPUT_PLANES, SIZE, SIZE), dtype=torch.float32),
             "policy": torch.cat(policies) if policies else torch.empty((0, POLICY_SIZE), dtype=torch.float32),
             "value": torch.cat(values) if values else torch.empty((0,), dtype=torch.float32),
+            "ownership": torch.cat(ownerships) if ownerships else torch.empty((0, SIZE * SIZE), dtype=torch.float32),
         }
         torch.save(blob, out_path)
         print(f"[{reason}] saved {blob['states'].shape[0]} samples to {out_path}", flush=True)
@@ -331,10 +343,11 @@ def main() -> None:
             fast_iterations=args.fast_iters,
             full_search_fraction=args.full_search_fraction,
         )
-        for st, pol, val, moves, winner, g_idx in results:
+        for st, pol, val, own, moves, winner, g_idx in results:
             states.append(st)
             policies.append(pol)
             values.append(val)
+            ownerships.append(own)
             games_completed += 1
             elapsed = time.perf_counter() - started
             if first_completion_at is None:
@@ -394,10 +407,11 @@ def main() -> None:
                 try:
                     payload = progress_queue.get(timeout=1.0)
                     res = torch.load(io.BytesIO(payload), weights_only=False)
-                    st, pol, val, moves, winner, g_idx = res
+                    st, pol, val, own, moves, winner, g_idx = res
                     states.append(st)
                     policies.append(pol)
                     values.append(val)
+                    ownerships.append(own)
                     games_completed += 1
                     elapsed = time.perf_counter() - started
                     if first_completion_at is None:
