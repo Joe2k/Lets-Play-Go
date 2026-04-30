@@ -11,3 +11,15 @@ venv/
 # training outputs / eval artifacts
 runs/
 eval_results.csv
+eval_boards/
+
+# profiling outputs
+*.prof
+*.prof.txt
+
+# assignment PDF
+PHYS303_HW05_2026.pdf
+
+# agent/skill locks
+skills-lock.json
+.agents/
