@@ -136,7 +136,7 @@ class PolicyValueModel:
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
         if model_path:
-            ckpt = torch.load(model_path, map_location=self.device)
+            ckpt = torch.load(model_path, map_location=self.device, weights_only=True)
             state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
             self.net.load_state_dict(state)
 

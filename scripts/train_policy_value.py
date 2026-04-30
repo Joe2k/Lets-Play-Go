@@ -75,7 +75,7 @@ def main() -> None:
     policy_chunks: list["torch.Tensor"] = []
     value_chunks: list["torch.Tensor"] = []
     for path in args.data:
-        blob = torch.load(path, map_location="cpu")
+        blob = torch.load(path, map_location="cpu", weights_only=True)
         states_chunks.append(blob["states"].float())
         policy_chunks.append(blob["policy"].float())
         value_chunks.append(blob["value"].float())
