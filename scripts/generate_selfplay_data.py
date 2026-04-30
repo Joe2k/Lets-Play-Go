@@ -226,7 +226,21 @@ def _play_batch_games(
                     print(f"  -> Game {g_idx} finished in {len(p_list)} moves (winner: {winner})", flush=True)
                 indices_to_remove.append(i)
                 continue
-                
+
+            # Auto-pass when no useful moves remain (only own_eyes / own_territory
+            # left). Record pass=1 as the policy target so future generations learn
+            # when passing is correct, then pass the turn without consulting PUCT.
+            if not candidate_moves(game):
+                st = encode_game_tensor(game)[0].cpu()
+                pol = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+                pol[PASS_INDEX] = 1.0
+                game_states[i].append(st)
+                game_policies[i].append(pol)
+                game_players[i].append(game.to_move)
+                game.pass_turn()
+                active_roots[i] = None
+                continue
+
             pol = torch.zeros(POLICY_SIZE, dtype=torch.float32)
             visits: dict = {}
             for move, ch in root.children.items():
@@ -308,6 +322,14 @@ def _play_one_game_mcts(
     while not game.finished and move_count < max_moves:
         cands = candidate_moves(game)
         if not cands:
+            # Record pass=1 target before force-passing so the model gets
+            # supervised signal for when passing is correct.
+            st = encode_game_tensor(game)[0].cpu()
+            pol = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+            pol[PASS_INDEX] = 1.0
+            game_states.append(st)
+            game_policies.append(pol)
+            game_players.append(game.to_move)
             game.pass_turn()
             move_count += 1
             continue
