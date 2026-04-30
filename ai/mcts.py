@@ -43,6 +43,7 @@ That keeps the inner loop fast - is_legal in the hot path was costing
 
 from __future__ import annotations
 
+import functools
 import heapq
 import math
 import random
@@ -60,21 +61,28 @@ _PROG_WIDEN_K = 2.2
 _PROG_WIDEN_ALPHA = 0.55
 _RAVE_EQUIV = 120.0
 
+_ADJACENT: list[tuple[int, ...]] = []
+for _idx in range(SIZE * SIZE):
+    _r, _c = divmod(_idx, SIZE)
+    _adj = []
+    for _dr, _dc in _NEIGHBORS:
+        _nr, _nc = _r + _dr, _c + _dc
+        if 0 <= _nr < SIZE and 0 <= _nc < SIZE:
+            _adj.append(_nr * SIZE + _nc)
+    _ADJACENT.append(tuple(_adj))
 
-def _is_own_eye(board_flat: list[int], r: int, c: int, color: int) -> bool:
-    """True if (r,c) is empty and every in-bounds 4-neighbor is `color`.
+
+def _is_own_eye(board_flat: tuple[int, ...], idx: int, color: int) -> bool:
+    """True if `idx` is empty and every in-bounds 4-neighbor is `color`.
 
     4-neighbor definition only (no diagonal-corner refinement). Good
     enough for 9x9 rollouts and easier to defend orally than the full
     eye-shape rule.
     """
-    if board_flat[r * SIZE + c] != EMPTY:
+    if board_flat[idx] != EMPTY:
         return False
-    for dr, dc in _NEIGHBORS:
-        nr, nc = r + dr, c + dc
-        if not (0 <= nr < SIZE and 0 <= nc < SIZE):
-            continue
-        if board_flat[nr * SIZE + nc] != color:
+    for nidx in _ADJACENT[idx]:
+        if board_flat[nidx] != color:
             return False
     return True
 
@@ -125,7 +133,7 @@ def _move_priority(game: GoGame, move: tuple[int, int]) -> int:
     return priority
 
 
-def _own_territory_indices(board: list[int], color: int) -> set[int]:
+def _own_territory_indices(board: tuple[int, ...], color: int) -> set[int]:
     """Flat indices of empty squares lying in regions bordered only by `color`.
 
     Mirrors GoGame._territory's Chinese-area-scoring definition: an empty
@@ -140,27 +148,37 @@ def _own_territory_indices(board: list[int], color: int) -> set[int]:
         if visited[start] or board[start] != EMPTY:
             continue
         region: list[int] = []
-        borders: set[int] = set()
+        borders_mask = 0
         stack = [start]
         visited[start] = True
         while stack:
             idx = stack.pop()
             region.append(idx)
-            r, c = divmod(idx, SIZE)
-            for dr, dc in _NEIGHBORS:
-                nr, nc = r + dr, c + dc
-                if not (0 <= nr < SIZE and 0 <= nc < SIZE):
-                    continue
-                nidx = nr * SIZE + nc
+            for nidx in _ADJACENT[idx]:
                 v = board[nidx]
                 if v == EMPTY:
                     if not visited[nidx]:
                         visited[nidx] = True
                         stack.append(nidx)
                 else:
-                    borders.add(v)
-        if borders == {color}:
+                    borders_mask |= v
+        if borders_mask == color:
             out.update(region)
+    return out
+
+
+@functools.lru_cache(maxsize=16384)
+def _cached_candidate_moves(board_tuple: tuple[int, ...], color: int) -> list[tuple[int, int]]:
+    own_territory = _own_territory_indices(board_tuple, color)
+    out: list[tuple[int, int]] = []
+    for idx in range(SIZE * SIZE):
+        if board_tuple[idx] != EMPTY:
+            continue
+        if idx in own_territory:
+            continue
+        if _is_own_eye(board_tuple, idx, color):
+            continue
+        out.append(divmod(idx, SIZE))
     return out
 
 
@@ -174,21 +192,7 @@ def candidate_moves(game: GoGame) -> list[tuple[int, int]]:
     may still slip through and are filtered downstream by place_stone
     returning False.
     """
-    color = game.to_move
-    board = game.board
-    own_territory = _own_territory_indices(board, color)
-    out: list[tuple[int, int]] = []
-    for r in range(SIZE):
-        for c in range(SIZE):
-            idx = r * SIZE + c
-            if board[idx] != EMPTY:
-                continue
-            if idx in own_territory:
-                continue
-            if _is_own_eye(board, r, c, color):
-                continue
-            out.append((r, c))
-    return out
+    return _cached_candidate_moves(tuple(game.board), game.to_move)
 
 
 def tree_candidate_moves(game: GoGame) -> list[tuple[int, int]]:
