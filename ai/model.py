@@ -106,22 +106,22 @@ def encode_game_tensor(game: GoGame) -> torch.Tensor:
     return torch.stack([p0, p1, p2]).unsqueeze(0)
 
 
-def encode_games_batch(games: list[GoGame]) -> torch.Tensor:
+def encode_games_batch(games: list[GoGame], device: Optional[torch.device] = None) -> torch.Tensor:
     """Return [N, 3, 9, 9] float tensor for a batch of games."""
     require_torch()
     if not games:
-        return torch.empty((0, 3, SIZE, SIZE), dtype=torch.float32)
-    
+        return torch.empty((0, 3, SIZE, SIZE), dtype=torch.float32, device=device)
+
     # Using a list comprehension for boards is still necessary as they are in GoGame objects,
-    # but we move the tensor heavy lifting to vectorized operations.
-    boards = torch.tensor([g.board for g in games], dtype=torch.float32)  # [N, 81]
-    me_colors = torch.tensor([g.to_move for g in games], dtype=torch.float32).view(-1, 1)
-    opp_colors = torch.where(me_colors == BLACK, torch.tensor(WHITE, dtype=torch.float32), torch.tensor(BLACK, dtype=torch.float32))
+    # but we move the tensor heavy lifting to vectorized operations directly on the target device.
+    boards = torch.tensor([g.board for g in games], dtype=torch.float32, device=device)  # [N, 81]
+    me_colors = torch.tensor([g.to_move for g in games], dtype=torch.float32, device=device).view(-1, 1)
+    opp_colors = torch.where(me_colors == BLACK, torch.tensor(WHITE, dtype=torch.float32, device=device), torch.tensor(BLACK, dtype=torch.float32, device=device))
 
     p0 = (boards == me_colors).float().view(-1, SIZE, SIZE)
     p1 = (boards == opp_colors).float().view(-1, SIZE, SIZE)
-    p2 = torch.ones((len(games), SIZE, SIZE), dtype=torch.float32)
-    
+    p2 = torch.ones((len(games), SIZE, SIZE), dtype=torch.float32, device=device)
+
     return torch.stack([p0, p1, p2], dim=1)
 
 
@@ -133,6 +133,8 @@ class PolicyValueModel:
         self.device = torch.device(device)
         self.net = TinyPolicyValueNet().to(self.device)
         self.net.eval()
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
         if model_path:
             ckpt = torch.load(model_path, map_location=self.device)
             state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
@@ -146,7 +148,7 @@ class PolicyValueModel:
         if not games:
             return [], []
         with torch.no_grad():
-            x = encode_games_batch(games).to(self.device)
+            x = encode_games_batch(games, device=self.device)
             logits, values = self.net(x)
             # Softmax across the move dimension (dim=1 of [N, 81])
             probs = torch.softmax(logits, dim=1).cpu().tolist()
