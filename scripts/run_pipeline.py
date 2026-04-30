@@ -125,6 +125,9 @@ def _self_play(
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
         return
 
+    predictor = state.best_checkpoint()
+    is_bootstrap = predictor is None
+
     cmd = [
         PYTHON,
         str(ROOT / "scripts" / "generate_selfplay_data.py"),
@@ -141,11 +144,19 @@ def _self_play(
         "--device", device,
         "--workers", str(workers),
         "--batch-size", str(batch_size),
-        "--c-puct", str(c_puct),
     ]
-    predictor = state.best_checkpoint()
-    if predictor is not None:
-        cmd += ["--predictor-checkpoint", predictor]
+
+    if is_bootstrap:
+        # Gen 0: use pure MCTS (no neural net) for strong bootstrap data.
+        # MCTS doesn't need c_puct or a model checkpoint.
+        cmd += ["--engine", "mcts"]
+        print(f"[gen {gen_idx}] Bootstrap: using MCTS engine (no neural net)")
+    else:
+        cmd += [
+            "--engine", "puct",
+            "--c-puct", str(c_puct),
+            "--predictor-checkpoint", predictor,
+        ]
 
     started = time.perf_counter()
     _check(cmd)

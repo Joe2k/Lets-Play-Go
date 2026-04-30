@@ -36,6 +36,7 @@ from ai.model import (
     torch,
 )
 from ai.puct_agent import PASS_MOVE, PUCTNode, _sample_from_visits, run_puct_search, run_batched_puct_search
+from ai.mcts import Node as MCTSNode, best_move as mcts_best_move, candidate_moves, search as mcts_search
 from engine.go_engine import BLACK, SIZE, WHITE, GoGame
 
 
@@ -268,6 +269,102 @@ def _play_batch_games(
     return results
 
 
+def _mcts_worker(start_idx, num_games, seed_base, max_moves, iterations, temperature, value_margin_scale):
+    """Worker for parallel MCTS self-play. Must be module-level for pickling."""
+    results = []
+    for i in range(num_games):
+        g_idx = start_idx + i
+        seed = seed_base + 10007 * g_idx
+        res = _play_one_game_mcts(
+            game_idx=g_idx,
+            seed=seed,
+            max_moves=max_moves,
+            iterations=iterations,
+            temperature=temperature,
+            value_margin_scale=value_margin_scale,
+        )
+        results.append(res)
+    return results
+
+
+def _play_one_game_mcts(
+    game_idx: int,
+    seed: int,
+    max_moves: int,
+    iterations: int,
+    temperature: float,
+    value_margin_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+    """Play a single game with MCTS and return training data."""
+    import math
+    rng = random.Random(seed)
+    game = GoGame()
+    game_states: list[torch.Tensor] = []
+    game_policies: list[torch.Tensor] = []
+    game_players: list[int] = []
+
+    move_count = 0
+    while not game.finished and move_count < max_moves:
+        cands = candidate_moves(game)
+        if not cands:
+            game.pass_turn()
+            move_count += 1
+            continue
+
+        root = MCTSNode(parent=None, move=None, game=game)
+        mcts_search(game, root, iterations=iterations, c=math.sqrt(2), rng=rng)
+
+        visit_sum = sum(ch.visits for ch in root.children.values())
+        if visit_sum <= 0:
+            game.pass_turn()
+            move_count += 1
+            continue
+
+        # Record state and policy BEFORE making the move
+        st = encode_game_tensor(game)[0].cpu()
+        pol = torch.zeros(POLICY_SIZE, dtype=torch.float32)
+        for move, ch in root.children.items():
+            pol[move[0] * SIZE + move[1]] = float(ch.visits) / float(visit_sum)
+        # Pass gets 0 probability since MCTS doesn't search pass
+
+        game_states.append(st)
+        game_policies.append(pol)
+        game_players.append(game.to_move)
+
+        # Sample move by visit-count temperature
+        visits = {move: ch.visits for move, ch in root.children.items()}
+        temp = temperature if move_count < 20 else max(0.05, temperature * 0.25)
+        mv = _sample_from_visits(visits, rng, temp)
+
+        if not game.place_stone(*mv):
+            game.pass_turn()
+        move_count += 1
+
+    winner = game.score()["winner"]
+    p_list = game_players
+
+    if value_margin_scale > 0.0:
+        score_dict = game.score()
+        margin = score_dict["black"] - score_dict["white"]
+        scaled_margin = max(-1.0, min(1.0, margin / value_margin_scale))
+        v_list = [scaled_margin if p == BLACK else -scaled_margin for p in p_list]
+    else:
+        v_list = [1.0 if p == winner else -1.0 for p in p_list]
+
+    abs_owner = game.ownership_map()
+    own_list = []
+    for p in p_list:
+        mult = 1.0 if p == BLACK else -1.0
+        own_list.append(torch.tensor([mult * v for v in abs_owner], dtype=torch.float32))
+
+    st_tensor = torch.stack(game_states) if game_states else torch.empty((0, INPUT_PLANES, SIZE, SIZE), dtype=torch.float32)
+    pol_tensor = torch.stack(game_policies) if game_policies else torch.empty((0, POLICY_SIZE), dtype=torch.float32)
+    val_tensor = torch.tensor(v_list, dtype=torch.float32) if v_list else torch.empty((0,), dtype=torch.float32)
+    own_tensor = torch.stack(own_list) if own_list else torch.empty((0, SIZE * SIZE), dtype=torch.float32)
+
+    return st_tensor, pol_tensor, val_tensor, own_tensor, len(p_list), winner, game_idx
+
+
 def _format_eta(games_done: int, games_total: int, elapsed: float, first_completion_at: float) -> str:
     """ETA computed from the post-warmup finish rate.
 
@@ -318,6 +415,10 @@ def main() -> None:
     p.add_argument("--value-margin-scale", type=float, default=20.0,
                    help="Scale factor for score-margin value targets (default: 20.0). "
                         "Set to 0.0 for binary ±1 targets.")
+    p.add_argument("--engine", choices=["puct", "mcts"], default="puct",
+                   help="Self-play engine: puct (neural-guided, default) or mcts "
+                        "(pure Monte-Carlo tree search, no neural net needed). "
+                        "Use mcts for gen 0 bootstrap when no checkpoint exists.")
     args = p.parse_args()
 
     out_path = pathlib.Path(args.output)
@@ -339,50 +440,13 @@ def main() -> None:
     games_completed = 0
     first_completion_at: Optional[float] = None  # elapsed when game 1 finishes
 
-    if args.workers == 1:
-        print(f"Starting 1 worker on {args.device} (batch_size={args.batch_size})...", flush=True)
-        predictor = None
-        if args.predictor_checkpoint:
-            predictor = PolicyValueModel(model_path=args.predictor_checkpoint, device=args.device)
-        else:
-            predictor = _UniformPredictor()
-            
-        # We can just run one big batch if it's 1 worker
-        results = _play_batch_games(
-            start_game_idx=0,
-            num_games=args.games,
-            batch_size=args.batch_size,
-            seed_base=args.seed,
-            max_moves=args.max_moves,
-            iterations=args.iterations,
-            temperature=args.temperature,
-            add_root_noise=not args.no_noise,
-            c_puct=args.c_puct,
-            progress_queue=None,
-            predictor=predictor,
-            fast_iterations=args.fast_iters,
-            full_search_fraction=args.full_search_fraction,
-            pass_penalty=args.pass_penalty,
-            resign_threshold=args.resign_threshold,
-            resign_min_moves=args.resign_min_moves,
-            value_margin_scale=args.value_margin_scale,
-        )
-        for st, pol, val, own, moves, winner, g_idx in results:
-            states.append(st)
-            policies.append(pol)
-            values.append(val)
-            ownerships.append(own)
-            games_completed += 1
-            elapsed = time.perf_counter() - started
-            if first_completion_at is None:
-                first_completion_at = elapsed
-            eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
-            print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
-                  f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
-            if args.save_every > 0 and games_completed % args.save_every == 0:
-                _flush("checkpoint")
-    else:
-        # Multi-worker mode
+    if args.engine == "mcts":
+        # MCTS bootstrap mode: no neural net, pure tree search.
+        # MCTS is CPU-bound so we use ProcessPoolExecutor for parallelism.
+        print(f"Starting MCTS bootstrap on {args.workers} worker(s)...", flush=True)
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = mp.get_context("spawn")
+
         games_per_worker = args.games // args.workers
         remainder = args.games % args.workers
         worker_tasks = []
@@ -391,50 +455,15 @@ def main() -> None:
             num = games_per_worker + (1 if i < remainder else 0)
             if num > 0:
                 worker_tasks.append((
-                    current_start,
-                    num,
-                    args.batch_size,
-                    args.seed,
-                    args.max_moves,
-                    args.iterations,
-                    args.temperature,
-                    not args.no_noise,
-                    args.c_puct,
+                    current_start, num, args.seed, args.max_moves,
+                    args.iterations, args.temperature, args.value_margin_scale,
                 ))
                 current_start += num
 
-        print(f"Starting {args.workers} workers on {args.device} (batch_size={args.batch_size})...", flush=True)
-        from concurrent.futures import ProcessPoolExecutor
-        ctx = mp.get_context("spawn")
-        manager = ctx.Manager()
-        progress_queue = manager.Queue()
-        
-        pool = ProcessPoolExecutor(
-            max_workers=args.workers,
-            mp_context=ctx,
-            initializer=_init_worker,
-            initargs=(args.predictor_checkpoint, args.device),
-        )
-        
-        futs = [
-            pool.submit(
-                _play_batch_games, *t,
-                progress_queue=progress_queue,
-                fast_iterations=args.fast_iters,
-                full_search_fraction=args.full_search_fraction,
-                pass_penalty=args.pass_penalty,
-                resign_threshold=args.resign_threshold,
-                resign_min_moves=args.resign_min_moves,
-                value_margin_scale=args.value_margin_scale,
-            )
-            for t in worker_tasks
-        ]
-        
-        try:
-            while games_completed < args.games:
-                try:
-                    payload = progress_queue.get(timeout=1.0)
-                    res = torch.load(io.BytesIO(payload), weights_only=False)
+        with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as pool:
+            futs = [pool.submit(_mcts_worker, *t) for t in worker_tasks]
+            for fut in futs:
+                for res in fut.result():
                     st, pol, val, own, moves, winner, g_idx = res
                     states.append(st)
                     policies.append(pol)
@@ -449,24 +478,136 @@ def main() -> None:
                           f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
                     if args.save_every > 0 and games_completed % args.save_every == 0:
                         _flush("checkpoint")
-                except queue.Empty:
-                    # This happens when timeout=1.0 is reached
-                    pass
-                except Exception as e:
-                    print(f"Error reading from queue: {e}")
+    else:
+        # PUCT mode (neural-guided)
+        if args.workers == 1:
+            print(f"Starting 1 worker on {args.device} (batch_size={args.batch_size})...", flush=True)
+            predictor = None
+            if args.predictor_checkpoint:
+                predictor = PolicyValueModel(model_path=args.predictor_checkpoint, device=args.device)
+            else:
+                predictor = _UniformPredictor()
                 
-                # Check for completed or crashed workers
-                if all(f.done() for f in futs) and progress_queue.empty():
-                    for idx, f in enumerate(futs):
-                        if f.exception() is not None:
-                            print(f"\n[ERROR] Worker {idx} crashed with exception:\n{f.exception()}", file=sys.stderr)
-                    break
-        except KeyboardInterrupt:
-            print("\nInterrupted.")
-            _flush("interrupted")
+            # We can just run one big batch if it's 1 worker
+            results = _play_batch_games(
+                start_game_idx=0,
+                num_games=args.games,
+                batch_size=args.batch_size,
+                seed_base=args.seed,
+                max_moves=args.max_moves,
+                iterations=args.iterations,
+                temperature=args.temperature,
+                add_root_noise=not args.no_noise,
+                c_puct=args.c_puct,
+                progress_queue=None,
+                predictor=predictor,
+                fast_iterations=args.fast_iters,
+                full_search_fraction=args.full_search_fraction,
+                pass_penalty=args.pass_penalty,
+                resign_threshold=args.resign_threshold,
+                resign_min_moves=args.resign_min_moves,
+                value_margin_scale=args.value_margin_scale,
+            )
+            for st, pol, val, own, moves, winner, g_idx in results:
+                states.append(st)
+                policies.append(pol)
+                values.append(val)
+                ownerships.append(own)
+                games_completed += 1
+                elapsed = time.perf_counter() - started
+                if first_completion_at is None:
+                    first_completion_at = elapsed
+                eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
+                print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
+                      f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
+                if args.save_every > 0 and games_completed % args.save_every == 0:
+                    _flush("checkpoint")
+        else:
+            # Multi-worker PUCT mode
+            games_per_worker = args.games // args.workers
+            remainder = args.games % args.workers
+            worker_tasks = []
+            current_start = 0
+            for i in range(args.workers):
+                num = games_per_worker + (1 if i < remainder else 0)
+                if num > 0:
+                    worker_tasks.append((
+                        current_start,
+                        num,
+                        args.batch_size,
+                        args.seed,
+                        args.max_moves,
+                        args.iterations,
+                        args.temperature,
+                        not args.no_noise,
+                        args.c_puct,
+                    ))
+                    current_start += num
+
+            print(f"Starting {args.workers} workers on {args.device} (batch_size={args.batch_size})...", flush=True)
+            from concurrent.futures import ProcessPoolExecutor
+            ctx = mp.get_context("spawn")
+            manager = ctx.Manager()
+            progress_queue = manager.Queue()
+            
+            pool = ProcessPoolExecutor(
+                max_workers=args.workers,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(args.predictor_checkpoint, args.device),
+            )
+            
+            futs = [
+                pool.submit(
+                    _play_batch_games, *t,
+                    progress_queue=progress_queue,
+                    fast_iterations=args.fast_iters,
+                    full_search_fraction=args.full_search_fraction,
+                    pass_penalty=args.pass_penalty,
+                    resign_threshold=args.resign_threshold,
+                    resign_min_moves=args.resign_min_moves,
+                    value_margin_scale=args.value_margin_scale,
+                )
+                for t in worker_tasks
+            ]
+            
+            try:
+                while games_completed < args.games:
+                    try:
+                        payload = progress_queue.get(timeout=1.0)
+                        res = torch.load(io.BytesIO(payload), weights_only=False)
+                        st, pol, val, own, moves, winner, g_idx = res
+                        states.append(st)
+                        policies.append(pol)
+                        values.append(val)
+                        ownerships.append(own)
+                        games_completed += 1
+                        elapsed = time.perf_counter() - started
+                        if first_completion_at is None:
+                            first_completion_at = elapsed
+                        eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
+                        print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
+                              f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
+                        if args.save_every > 0 and games_completed % args.save_every == 0:
+                            _flush("checkpoint")
+                    except queue.Empty:
+                        # This happens when timeout=1.0 is reached
+                        pass
+                    except Exception as e:
+                        print(f"Error reading from queue: {e}")
+                    
+                    # Check for completed or crashed workers
+                    if all(f.done() for f in futs) and progress_queue.empty():
+                        for idx, f in enumerate(futs):
+                            if f.exception() is not None:
+                                print(f"\n[ERROR] Worker {idx} crashed with exception:\n{f.exception()}", file=sys.stderr)
+                        break
+            except KeyboardInterrupt:
+                print("\nInterrupted.")
+                _flush("interrupted")
+                pool.shutdown(wait=False, cancel_futures=True)
+                sys.exit(0)
             pool.shutdown(wait=False, cancel_futures=True)
-            sys.exit(0)
-        pool.shutdown(wait=False, cancel_futures=True)
 
     _flush("done")
 
