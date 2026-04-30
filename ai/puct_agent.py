@@ -44,6 +44,12 @@ class Predictor(Protocol):
 
 def _select_child(node: PUCTNode, c_puct: float) -> tuple[Move, PUCTNode]:
     parent_sqrt = math.sqrt(max(1, node.visit_count))
+    
+    # First Play Urgency (FPU): Assign unvisited nodes the parent's Q value
+    # instead of 0.0. This prevents the search from wasting iterations on
+    # terrible moves when the parent position is already favorable.
+    fpu_value = node.q if node.visit_count > 0 else 0.0
+    
     best_score = -1e18
     best_move: Optional[Move] = None
     best_child: Optional[PUCTNode] = None
@@ -51,7 +57,10 @@ def _select_child(node: PUCTNode, c_puct: float) -> tuple[Move, PUCTNode]:
         # child.q is from child.to_play's perspective; parent wants the child
         # whose position is worst for the child (i.e., best for parent).
         u = c_puct * child.prior * parent_sqrt / (1 + child.visit_count)
-        score = -child.q + u
+        
+        child_q = -child.q if child.visit_count > 0 else fpu_value
+        score = child_q + u
+        
         if score > best_score:
             best_score = score
             best_move = move
