@@ -120,6 +120,7 @@ def _self_play(
     resign_threshold: float = 0.9,
     resign_min_moves: int = 30,
     value_margin_scale: float = 20.0,
+    max_moves: int = 220,
 ) -> None:
     if out_path.exists() and state.gen(gen_idx).get("self_play_done"):
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
@@ -158,6 +159,7 @@ def _self_play(
         "--resign-threshold", str(resign_threshold),
         "--resign-min-moves", str(resign_min_moves),
         "--value-margin-scale", str(value_margin_scale),
+        "--max-moves", str(max_moves),
         "--seed", str(seed_base + 100 * gen_idx),
         "--output", str(out_path),
         "--device", device,
@@ -325,6 +327,10 @@ def main() -> None:
     p.add_argument("--self-play-value-margin-scale", type=float, default=15.0,
                    help="Scale factor for score-margin value targets (0 = binary ±1). "
                         "15 is appropriate for 9x9; 20 compresses typical margins too much.")
+    p.add_argument("--self-play-max-moves", type=int, default=220,
+                   help="Hard cap on moves per self-play game. Games hitting the cap "
+                        "produce noisy ownership/value targets; lower values (~150) help "
+                        "filter pathologically long games on 9x9.")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3,
@@ -409,7 +415,8 @@ def main() -> None:
                    pass_penalty=args.self_play_pass_penalty,
                    resign_threshold=args.self_play_resign_threshold,
                    resign_min_moves=args.self_play_resign_min_moves,
-                   value_margin_scale=args.self_play_value_margin_scale)
+                   value_margin_scale=args.self_play_value_margin_scale,
+                   max_moves=args.self_play_max_moves)
 
         # Sliding replay window: train on the last `replay_window`
         # self-play datasets that actually exist on disk.
