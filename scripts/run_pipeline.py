@@ -186,6 +186,7 @@ def _gate_eval(
     threshold: float,
     csv_path: pathlib.Path,
     c_puct: float = 1.25,
+    workers: int = 1,
 ) -> tuple[bool, Optional[float]]:
     """Returns (promoted, win_rate). Win rate is None if eval was skipped."""
     if state.gen(gen_idx).get("eval_done"):
@@ -215,6 +216,7 @@ def _gate_eval(
         "--csv", str(csv_path),
         "--gate-threshold", str(threshold),
         "--c-puct", str(c_puct),
+        "--workers", str(workers),
         "--add-noise",
     ]
     started = time.perf_counter()
@@ -340,6 +342,7 @@ def main() -> None:
             threshold=args.gate_threshold,
             csv_path=eval_csv,
             c_puct=args.c_puct,
+            workers=args.workers
         )
 
         if promoted:

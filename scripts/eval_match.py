@@ -364,6 +364,24 @@ def _append_csv(
             )
 
 
+def _play_one_game_worker(i: int, a: AgentSpec, b: AgentSpec, seed: int, max_moves: int) -> tuple[int, GameResult, float]:
+    if i % 2 == 0:
+        black_spec, white_spec = a, b
+    else:
+        black_spec, white_spec = b, a
+
+    import time
+    game_started = time.perf_counter()
+    result = _play_one_game(
+        black_spec=black_spec,
+        white_spec=white_spec,
+        seed=seed + 1009 * i,
+        max_moves=max_moves,
+    )
+    game_dt = time.perf_counter() - game_started
+    return i, result, game_dt
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Evaluate two agent configs head-to-head")
     p.add_argument("--games", type=int, default=20)
@@ -390,6 +408,8 @@ def main() -> None:
     p.add_argument("--add-noise", action="store_true",
                    help="Enable Dirichlet root noise for PUCT (off by default — "
                         "evaluation should not inject exploration noise).")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel workers for evaluation games.")
     args = p.parse_args()
 
     a = AgentSpec(name=args.a_name, iterations=args.a_iters,
@@ -431,49 +451,78 @@ def main() -> None:
     b_wins_running = 0
 
     try:
-        for i in range(args.games):
-            if i % 2 == 0:
-                black_spec, white_spec = a, b
-            else:
-                black_spec, white_spec = b, a
+        if args.workers == 1:
+            for i in range(args.games):
+                _, result, game_dt = _play_one_game_worker(i, a, b, args.seed, args.max_moves)
+                results.append(result)
 
-            game_started = time.perf_counter()
-            result = _play_one_game(
-                black_spec=black_spec,
-                white_spec=white_spec,
-                seed=args.seed + 1009 * i,
-                max_moves=args.max_moves,
-            )
-            game_dt = time.perf_counter() - game_started
-            results.append(result)
+                if result.winner_name == a.name:
+                    a_wins_running += 1
+                else:
+                    b_wins_running += 1
 
-            if result.winner_name == a.name:
-                a_wins_running += 1
-            else:
-                b_wins_running += 1
-
-            played = i + 1
-            wr = a_wins_running / played * 100.0
-            score_note = ""
-            if result.score_match is False:
-                score_note = (
-                    f" [score MISMATCH: ours={result.winner_name}"
-                    f" ({result.margin_for_black:+.1f}) vs"
-                    f" gnu={result.gnu_winner_name}"
-                    f" ({result.gnu_margin_for_black:+.1f})]"
+                played = i + 1
+                wr = a_wins_running / played * 100.0
+                score_note = ""
+                if result.score_match is False:
+                    score_note = (
+                        f" [score MISMATCH: ours={result.winner_name}"
+                        f" ({result.margin_for_black:+.1f}) vs"
+                        f" gnu={result.gnu_winner_name}"
+                        f" ({result.gnu_margin_for_black:+.1f})]"
+                    )
+                print(
+                    f"  [{played}/{args.games}] {result.black_spec.name}(B) vs {result.white_spec.name}(W) "
+                    f"-> {result.winner_name} | score {result.black_score:.1f}-{result.white_score:.1f} "
+                    f"| {result.moves} moves | {game_dt:.1f}s | "
+                    f"{a.name}={a_wins_running} {b.name}={b_wins_running} ({wr:.1f}%)"
+                    f"{score_note}"
                 )
-            print(
-                f"  [{played}/{args.games}] {result.black_spec.name}(B) vs {result.white_spec.name}(W) "
-                f"-> {result.winner_name} | score {result.black_score:.1f}-{result.white_score:.1f} "
-                f"| {result.moves} moves | {game_dt:.1f}s | "
-                f"{a.name}={a_wins_running} {b.name}={b_wins_running} ({wr:.1f}%)"
-                f"{score_note}"
-            )
 
-            if csv_path is not None:
-                _append_csv(csv_path, [result], timestamp, match_id, start_index=i)
-            if md_path is not None:
-                _append_md_game(md_path, i, result)
+                if csv_path is not None:
+                    _append_csv(csv_path, [result], timestamp, match_id, start_index=i)
+                if md_path is not None:
+                    _append_md_game(md_path, i, result)
+        else:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as pool:
+                futs = [
+                    pool.submit(_play_one_game_worker, i, a, b, args.seed, args.max_moves)
+                    for i in range(args.games)
+                ]
+                for fut in as_completed(futs):
+                    i, result, game_dt = fut.result()
+                    results.append(result)
+
+                    if result.winner_name == a.name:
+                        a_wins_running += 1
+                    else:
+                        b_wins_running += 1
+
+                    played = len(results)
+                    wr = a_wins_running / played * 100.0
+                    score_note = ""
+                    if result.score_match is False:
+                        score_note = (
+                            f" [score MISMATCH: ours={result.winner_name}"
+                            f" ({result.margin_for_black:+.1f}) vs"
+                            f" gnu={result.gnu_winner_name}"
+                            f" ({result.gnu_margin_for_black:+.1f})]"
+                        )
+                    print(
+                        f"  [{played}/{args.games}] (game {i+1}) {result.black_spec.name}(B) vs {result.white_spec.name}(W) "
+                        f"-> {result.winner_name} | score {result.black_score:.1f}-{result.white_score:.1f} "
+                        f"| {result.moves} moves | {game_dt:.1f}s | "
+                        f"{a.name}={a_wins_running} {b.name}={b_wins_running} ({wr:.1f}%)"
+                        f"{score_note}"
+                    )
+
+                    if csv_path is not None:
+                        _append_csv(csv_path, [result], timestamp, match_id, start_index=i)
+                    if md_path is not None:
+                        _append_md_game(md_path, i, result)
     except KeyboardInterrupt:
         print("\nInterrupted; reporting on completed games.")
 
