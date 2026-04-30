@@ -292,8 +292,9 @@ def main() -> None:
                    help="Resign when root Q falls below this during self-play.")
     p.add_argument("--self-play-resign-min-moves", type=int, default=30,
                    help="Minimum moves before resignation is allowed in self-play.")
-    p.add_argument("--self-play-value-margin-scale", type=float, default=20.0,
-                   help="Scale factor for score-margin value targets (0 = binary ±1).")
+    p.add_argument("--self-play-value-margin-scale", type=float, default=15.0,
+                   help="Scale factor for score-margin value targets (0 = binary ±1). "
+                        "15 is appropriate for 9x9; 20 compresses typical margins too much.")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3,
