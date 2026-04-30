@@ -269,9 +269,8 @@ def _play_batch_games(
     return results
 
 
-def _mcts_worker(start_idx, num_games, seed_base, max_moves, iterations, temperature, value_margin_scale):
-    """Worker for parallel MCTS self-play. Must be module-level for pickling."""
-    results = []
+def _mcts_worker(start_idx, num_games, seed_base, max_moves, iterations, temperature, value_margin_scale, progress_queue):
+    """Worker for parallel MCTS self-play. Writes each result to queue as it finishes."""
     for i in range(num_games):
         g_idx = start_idx + i
         seed = seed_base + 10007 * g_idx
@@ -283,8 +282,10 @@ def _mcts_worker(start_idx, num_games, seed_base, max_moves, iterations, tempera
             temperature=temperature,
             value_margin_scale=value_margin_scale,
         )
-        results.append(res)
-    return results
+        if progress_queue is not None:
+            buf = io.BytesIO()
+            torch.save(res, buf)
+            progress_queue.put(buf.getvalue())
 
 
 def _play_one_game_mcts(
@@ -446,6 +447,8 @@ def main() -> None:
         print(f"Starting MCTS bootstrap on {args.workers} worker(s)...", flush=True)
         from concurrent.futures import ProcessPoolExecutor
         ctx = mp.get_context("spawn")
+        manager = ctx.Manager()
+        progress_queue = manager.Queue()
 
         games_per_worker = args.games // args.workers
         remainder = args.games % args.workers
@@ -457,13 +460,18 @@ def main() -> None:
                 worker_tasks.append((
                     current_start, num, args.seed, args.max_moves,
                     args.iterations, args.temperature, args.value_margin_scale,
+                    progress_queue,
                 ))
                 current_start += num
 
-        with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as pool:
-            futs = [pool.submit(_mcts_worker, *t) for t in worker_tasks]
-            for fut in futs:
-                for res in fut.result():
+        pool = ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx)
+        futs = [pool.submit(_mcts_worker, *t) for t in worker_tasks]
+
+        try:
+            while games_completed < args.games:
+                try:
+                    payload = progress_queue.get(timeout=1.0)
+                    res = torch.load(io.BytesIO(payload), weights_only=False)
                     st, pol, val, own, moves, winner, g_idx = res
                     states.append(st)
                     policies.append(pol)
@@ -478,6 +486,22 @@ def main() -> None:
                           f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
                     if args.save_every > 0 and games_completed % args.save_every == 0:
                         _flush("checkpoint")
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    print(f"Error reading from queue: {e}")
+
+                if all(f.done() for f in futs) and progress_queue.empty():
+                    for idx, f in enumerate(futs):
+                        if f.exception() is not None:
+                            print(f"\n[ERROR] Worker {idx} crashed with exception:\n{f.exception()}", file=sys.stderr)
+                    break
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            _flush("interrupted")
+            pool.shutdown(wait=False, cancel_futures=True)
+            sys.exit(0)
+        pool.shutdown(wait=False, cancel_futures=True)
     else:
         # PUCT mode (neural-guided)
         if args.workers == 1:
