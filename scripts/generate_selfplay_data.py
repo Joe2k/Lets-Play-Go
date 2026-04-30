@@ -35,7 +35,7 @@ from ai.model import (
     require_torch,
     torch,
 )
-from ai.puct_agent import PASS_MOVE, PUCTNode, run_puct_search, run_batched_puct_search
+from ai.puct_agent import PASS_MOVE, PUCTNode, _sample_from_visits, run_puct_search, run_batched_puct_search
 from engine.go_engine import BLACK, SIZE, WHITE, GoGame
 
 
@@ -44,15 +44,6 @@ class _UniformPredictor:
 
     def predict(self, game: GoGame) -> tuple[list[float], float]:
         return [1.0 / POLICY_SIZE] * POLICY_SIZE, 0.0
-
-
-def _sample_from_visits(visits: dict, rng: random.Random, temperature: float):
-    items = list(visits.items())
-    if temperature <= 1e-6:
-        return max(items, key=lambda kv: kv[1])[0]
-    weights = [max(1e-9, float(v) ** (1.0 / temperature)) for _, v in items]
-    moves = [m for m, _ in items]
-    return rng.choices(moves, weights=weights, k=1)[0]
 
 
 # --- Global worker state ---

@@ -199,6 +199,7 @@ def _gate_eval(
     csv_path: pathlib.Path,
     c_puct: float = 1.25,
     workers: int = 1,
+    eval_temperature: float = 0.25,
 ) -> tuple[bool, Optional[float]]:
     """Returns (promoted, win_rate). Win rate is None if eval was skipped."""
     if state.gen(gen_idx).get("eval_done"):
@@ -229,7 +230,7 @@ def _gate_eval(
         "--gate-threshold", str(threshold),
         "--c-puct", str(c_puct),
         "--workers", str(workers),
-        "--add-noise",
+        "--eval-temperature", str(eval_temperature),
     ]
     started = time.perf_counter()
     _run(cmd)
@@ -275,11 +276,11 @@ def main() -> None:
                    help="Resume from this generation (skip earlier gens).")
     p.add_argument("--run-dir", type=str, default="runs/default",
                    help="Directory holding state.json, datasets, checkpoints, and logs.")
-    p.add_argument("--games", type=int, default=30,
+    p.add_argument("--games", type=int, default=60,
                    help="Self-play games per generation.")
-    p.add_argument("--self-play-iters", type=int, default=200,
+    p.add_argument("--self-play-iters", type=int, default=400,
                    help="MCTS/PUCT iterations per move during self-play.")
-    p.add_argument("--self-play-fast-iters", type=int, default=10,
+    p.add_argument("--self-play-fast-iters", type=int, default=50,
                    help="MCTS/PUCT iterations for fast searches during self-play.")
     p.add_argument("--self-play-full-search-fraction", type=float, default=0.25,
                    help="Fraction of self-play turns that use the full iteration count.")
@@ -294,10 +295,14 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--eval-games", type=int, default=30,
+    p.add_argument("--eval-games", type=int, default=40,
                    help="Games per gate-eval match. Below ~30 the win-rate "
                         "estimate is too noisy to gate at 0.55.")
-    p.add_argument("--eval-iters", type=int, default=200)
+    p.add_argument("--eval-iters", type=int, default=400)
+    p.add_argument("--eval-temperature", type=float, default=0.25,
+                   help="Temperature for visit-count sampling during gate eval. "
+                        "0 = deterministic argmax. Small values (0.25) create "
+                        "game diversity without corrupting search with Dirichlet noise.")
     p.add_argument("--gate-threshold", type=float, default=0.55,
                    help="Win rate needed to promote a new checkpoint.")
     p.add_argument("--replay-window", type=int, default=5,
@@ -389,6 +394,7 @@ def main() -> None:
             csv_path=eval_csv,
             c_puct=args.c_puct,
             workers=eval_workers,
+            eval_temperature=args.eval_temperature,
         )
 
         if promoted:

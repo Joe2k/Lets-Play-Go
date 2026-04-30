@@ -216,17 +216,47 @@ class GoGame:
         # not-yet-finished positions use the pure boundary-color rule so the
         # GUI's live score display is unchanged.
         if self.finished and self.loser is None:
-            self._ensure_groups()
-            alive_b = self._benson_alive(BLACK)
-            alive_w = self._benson_alive(WHITE)
-            dead_b, dead_w = self._dead_chains(alive_b, alive_w)
-            black_stones, white_stones, black_territory, white_territory = (
-                self._score_with_dead_removed(dead_b | dead_w)
-            )
+            return self.score_final()
         else:
             black_stones = self.board.count(BLACK)
             white_stones = self.board.count(WHITE)
             black_territory, white_territory = self._territory()
+
+        # Reported relative to the (possibly dead-removed) synthetic board so
+        # stones + territory + neutral always sums to the full board.
+        neutral_points = (
+            (SIZE * SIZE) - black_stones - white_stones - black_territory - white_territory
+        )
+
+        black_total = black_stones + black_territory
+        white_total = white_stones + white_territory + KOMI
+
+        if self.loser is not None:
+            winner = _other(self.loser)
+        else:
+            winner = BLACK if black_total > white_total else WHITE
+
+        return {
+            "black": black_total,
+            "white": white_total,
+            "black_stones": black_stones,
+            "white_stones": white_stones,
+            "black_territory": black_territory,
+            "white_territory": white_territory,
+            "neutral_points": neutral_points,
+            "komi": KOMI,
+            "winner": winner,
+        }
+
+    def score_final(self) -> dict:
+        """Score using dead-stone detection regardless of game state."""
+        self._ensure_groups()
+        alive_b = self._benson_alive(BLACK)
+        alive_w = self._benson_alive(WHITE)
+        dead_b, dead_w = self._dead_chains(alive_b, alive_w)
+        black_stones, white_stones, black_territory, white_territory = (
+            self._score_with_dead_removed(dead_b | dead_w)
+        )
 
         # Reported relative to the (possibly dead-removed) synthetic board so
         # stones + territory + neutral always sums to the full board.
@@ -557,9 +587,9 @@ class GoGame:
         """
         dead_black: set[int] = set()
         dead_white: set[int] = set()
-        seen_chains_dead: set[int] = set()
+        seen: set[int] = set()
         for gid, gr in self._groups.items():
-            if gid in seen_chains_dead:
+            if gid in seen:
                 continue
             color = gr.color
             alive_us = alive_black if color == BLACK else alive_white
@@ -604,11 +634,57 @@ class GoGame:
                 target = dead_black if color == BLACK else dead_white
                 for cgid in visited_chains:
                     target.update(self._groups[cgid].stones)
-                    seen_chains_dead.add(cgid)
+            seen.update(visited_chains)
+
+        # Fallback: mark individual non-alive chains in atari (≤1 liberty)
+        # as dead when their liberty cannot be defended by a Benson-alive
+        # friendly chain AND the opponent can legally play the capturing move.
+        # This catches stones that are obviously capturable but sit inside an
+        # enclosure whose captor is not itself unconditionally alive.
+        for gid, gr in self._groups.items():
+            if gr.color == BLACK:
+                if gid in alive_black or gid in dead_black:
+                    continue
+                target = dead_black
             else:
-                # Don't reconsider chains we already merged into this flood.
-                seen_chains_dead.update(visited_chains)
+                if gid in alive_white or gid in dead_white:
+                    continue
+                target = dead_white
+
+            liberties: set[int] = set()
+            for s in gr.stones:
+                for nidx in self._neighbors_of(s):
+                    if self.board[nidx] == EMPTY:
+                        liberties.add(nidx)
+            if len(liberties) > 1:
+                continue
+
+            if not self._is_capturable(gid):
+                continue
+
+            target.update(gr.stones)
+            seen.add(gid)
+
         return dead_black, dead_white
+
+    def _is_capturable(self, chain_gid: int) -> bool:
+        """Return True if the opponent can legally capture this chain."""
+        gr = self._groups[chain_gid]
+        liberties: set[int] = set()
+        for s in gr.stones:
+            for nidx in self._neighbors_of(s):
+                if self.board[nidx] == EMPTY:
+                    liberties.add(nidx)
+        if not liberties:
+            return True
+        if len(liberties) != 1:
+            return False
+        lib = liberties.pop()
+        r, c = divmod(lib, SIZE)
+        probe = self.clone_fast()
+        probe.to_move = _other(gr.color)
+        probe.finished = False
+        return probe.place_stone(r, c)
 
     def _score_with_dead_removed(
         self, dead: set[int]

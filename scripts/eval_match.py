@@ -86,6 +86,7 @@ class AgentSpec:
     c_puct: float = 1.25
     add_root_noise: bool = False
     pass_penalty: float = 0.0
+    eval_temperature: float = 0.0
 
 
 def _build_agent(spec: AgentSpec, seed: int):
@@ -98,6 +99,7 @@ def _build_agent(spec: AgentSpec, seed: int):
             c_puct=spec.c_puct,
             add_root_noise=spec.add_root_noise,
             pass_penalty=spec.pass_penalty,
+            eval_temperature=spec.eval_temperature,
         )
     if spec.engine == "gnugo":
         from ai.gnugo_agent import GnuGoAgent
@@ -416,6 +418,10 @@ def main() -> None:
                         "evaluation should not inject exploration noise).")
     p.add_argument("--pass-penalty", type=float, default=0.0,
                    help="Tiny penalty subtracted from pass move Q during PUCT selection.")
+    p.add_argument("--eval-temperature", type=float, default=0.0,
+                   help="Temperature for sampling moves by visit count during PUCT eval. "
+                        "0 = argmax (deterministic). Small values (0.25-0.5) create "
+                        "game diversity without corrupting the search like Dirichlet noise.")
     p.add_argument("--workers", type=int, default=1,
                    help="Parallel workers for evaluation games.")
     args = p.parse_args()
@@ -423,11 +429,13 @@ def main() -> None:
     a = AgentSpec(name=args.a_name, iterations=args.a_iters,
                   engine=args.a_engine, model_path=args.a_model,
                   c_puct=args.c_puct, add_root_noise=args.add_noise,
-                  pass_penalty=args.pass_penalty)
+                  pass_penalty=args.pass_penalty,
+                  eval_temperature=args.eval_temperature)
     b = AgentSpec(name=args.b_name, iterations=args.b_iters,
                   engine=args.b_engine, model_path=args.b_model,
                   c_puct=args.c_puct, add_root_noise=args.add_noise,
-                  pass_penalty=args.pass_penalty)
+                  pass_penalty=args.pass_penalty,
+                  eval_temperature=args.eval_temperature)
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     match_id = f"{a.name}_vs_{b.name}_{timestamp}"

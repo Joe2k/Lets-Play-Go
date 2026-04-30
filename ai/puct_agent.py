@@ -19,6 +19,15 @@ _DIRICHLET_ALPHA = 0.03
 _DIRICHLET_WEIGHT = 0.25
 
 
+def _sample_from_visits(visits: dict, rng: random.Random, temperature: float):
+    items = list(visits.items())
+    if temperature <= 1e-6:
+        return max(items, key=lambda kv: kv[1])[0]
+    weights = [max(1e-9, float(v) ** (1.0 / temperature)) for _, v in items]
+    moves = [m for m, _ in items]
+    return rng.choices(moves, weights=weights, k=1)[0]
+
+
 @dataclass
 class PUCTNode:
     to_play: int
@@ -272,6 +281,7 @@ class PUCTAgent:
         device: str = "cpu",
         add_root_noise: bool = False,
         pass_penalty: float = 0.0,
+        eval_temperature: float = 0.0,
     ) -> None:
         require_torch()
         self.iterations = iterations
@@ -280,6 +290,7 @@ class PUCTAgent:
         self._rng = random.Random(seed)
         self.model = PolicyValueModel(model_path=model_path, device=device)
         self.add_root_noise = add_root_noise
+        self.eval_temperature = eval_temperature
         self._root: Optional[PUCTNode] = None
         self._last_to_play: Optional[int] = None
 
@@ -302,7 +313,11 @@ class PUCTAgent:
         )
         if not self._root.children:
             return PASS_MOVE
-        best = max(self._root.children.items(), key=lambda kv: kv[1].visit_count)[0]
+        if self.eval_temperature > 0.0:
+            visits = {move: child.visit_count for move, child in self._root.children.items()}
+            best = _sample_from_visits(visits, self._rng, self.eval_temperature)
+        else:
+            best = max(self._root.children.items(), key=lambda kv: kv[1].visit_count)[0]
         # Promote chosen child to next root for tree reuse.
         self._root = self._root.children[best]
         self._last_to_play = _other(game.to_move)

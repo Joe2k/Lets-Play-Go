@@ -396,12 +396,12 @@ def test_score_dead_stones_removed_simple():
     # Eyes at (1,1) and (1,3).
     # White stone at (3,1) - enclosed but not in an eye.
     b[3][1] = WHITE
-    
+
     g = GoGame.from_position(b)
     g.pass_turn()
     g.pass_turn()
     assert g.finished
-    
+
     r = g.score()
     # White stone at (3,1) should be dead.
     assert r["white_stones"] == 0
@@ -411,3 +411,64 @@ def test_score_dead_stones_removed_simple():
     # Total cells = 81. Territory = 81 - 19 = 62.
     assert r["black_stones"] == 19
     assert r["black_territory"] == 62
+
+
+def test_dead_chains_catches_atari_and_no_liberty():
+    """Regression for Game 2 score mismatch.
+
+    The atari fallback must catch chains that are not Benson-alive but
+    have ≤1 liberty and are legally capturable by the opponent.
+    """
+    # Exact final board from Game 2 (gnugo_l1 vs pv_g14).
+    # fmt: off
+    board = [
+        [0, 1, 0, 0, 1, 1, 1, 1, 2],  # row 9
+        [0, 2, 1, 0, 1, 2, 2, 2, 2],  # row 8
+        [2, 1, 1, 1, 1, 1, 2, 0, 2],  # row 7
+        [0, 2, 2, 2, 1, 1, 1, 2, 0],  # row 6
+        [0, 2, 0, 1, 2, 1, 2, 2, 2],  # row 5
+        [0, 1, 0, 1, 2, 2, 1, 0, 0],  # row 4
+        [0, 1, 1, 1, 2, 0, 2, 0, 0],  # row 3
+        [0, 0, 0, 1, 2, 0, 0, 0, 0],  # row 2
+        [1, 1, 2, 2, 1, 1, 1, 0, 0],  # row 1
+    ]
+    # fmt: on
+    g = GoGame()
+    g.board = [board[r][c] for r in range(SIZE) for c in range(SIZE)]
+    g.to_move = BLACK
+    g._groups_dirty = True
+    g._ensure_groups()
+
+    alive_b = g._benson_alive(BLACK)
+    alive_w = g._benson_alive(WHITE)
+    dead_b, dead_w = g._dead_chains(alive_b, alive_w)
+
+    # B8 (white, 1 liberty) must be caught.
+    assert 1 * SIZE + 1 in dead_w, "B8 should be dead"
+    # C1-D1 (white pair, 1 shared liberty) must be caught.
+    assert 8 * SIZE + 2 in dead_w, "C1 should be dead"
+    assert 8 * SIZE + 3 in dead_w, "D1 should be dead"
+    # G4 (black, 1 liberty) must be caught.
+    assert 5 * SIZE + 6 in dead_b, "G4 should be dead"
+
+    # The score winner on this position must be Black.
+    g.finished = True
+    g.loser = None
+    g.history = [(0, 0), "pass", "pass"]
+    g.last_move = "pass"
+    r = g.score()
+    assert r["winner"] == BLACK
+
+
+def test_dead_chains_does_not_break_seki():
+    """A chain with 1 liberty that is NOT capturable must stay alive."""
+    # Simple seki: two groups share 2 liberties.
+    b = blank_board()
+    b[0][1] = BLACK; b[1][0] = BLACK; b[2][1] = BLACK
+    b[0][2] = WHITE; b[1][3] = WHITE; b[2][2] = WHITE
+    g = GoGame.from_position(b)
+    alive_b = g._benson_alive(BLACK)
+    alive_w = g._benson_alive(WHITE)
+    db, dw = g._dead_chains(alive_b, alive_w)
+    assert len(db) == 0
+    assert len(dw) == 0
