@@ -125,13 +125,32 @@ def _self_play(
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
         return
 
+    # Check for partial data to resume from
+    start_game = 0
+    if out_path.exists():
+        try:
+            import torch as _torch
+            existing = _torch.load(out_path, weights_only=False)
+            start_game = existing.get("games_completed", 0)
+            if start_game >= games:
+                print(f"[gen {gen_idx}] self-play already complete ({start_game}/{games} games), skipping.")
+                state.update_gen(gen_idx, self_play_done=True)
+                return
+            elif start_game > 0:
+                print(f"[gen {gen_idx}] resuming from game {start_game}/{games} (existing file: {out_path})")
+        except Exception:
+            print(f"[gen {gen_idx}] warning: could not read existing file, starting fresh")
+            start_game = 0
+
     predictor = state.best_checkpoint()
     is_bootstrap = predictor is None
 
+    remaining = games - start_game
     cmd = [
         PYTHON,
         str(ROOT / "scripts" / "generate_selfplay_data.py"),
-        "--games", str(games),
+        "--games", str(remaining),
+        "--start-game", str(start_game),
         "--iterations", str(iterations),
         "--fast-iters", str(fast_iters),
         "--full-search-fraction", str(full_search_fraction),

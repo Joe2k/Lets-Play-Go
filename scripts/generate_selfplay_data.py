@@ -420,31 +420,49 @@ def main() -> None:
                    help="Self-play engine: puct (neural-guided, default) or mcts "
                         "(pure Monte-Carlo tree search, no neural net needed). "
                         "Use mcts for gen 0 bootstrap when no checkpoint exists.")
+    p.add_argument("--start-game", type=int, default=0,
+                   help="Resume from this game index (append to existing output file).")
     args = p.parse_args()
 
     out_path = pathlib.Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     states, policies, values, ownerships = [], [], [], []
+    existing_games = 0
+    games_completed = 0  # NEW games completed in this run
+
+    # Load existing data when resuming
+    if args.start_game > 0 and out_path.exists():
+        print(f"[resume] loading existing data from {out_path} (starting from game {args.start_game})...", flush=True)
+        existing = torch.load(out_path, weights_only=False)
+        n_existing = existing["states"].shape[0]
+        states.append(existing["states"])
+        policies.append(existing["policy"])
+        values.append(existing["value"])
+        ownerships.append(existing["ownership"])
+        existing_games = existing.get("games_completed", 0)
+        print(f"[resume] loaded {n_existing} samples from {existing_games} existing games", flush=True)
 
     def _flush(reason: str) -> None:
+        total_completed = existing_games + games_completed
         blob = {
             "states": torch.cat(states) if states else torch.empty((0, INPUT_PLANES, SIZE, SIZE), dtype=torch.float32),
             "policy": torch.cat(policies) if policies else torch.empty((0, POLICY_SIZE), dtype=torch.float32),
             "value": torch.cat(values) if values else torch.empty((0,), dtype=torch.float32),
             "ownership": torch.cat(ownerships) if ownerships else torch.empty((0, SIZE * SIZE), dtype=torch.float32),
+            "games_completed": total_completed,
         }
         torch.save(blob, out_path)
-        print(f"[{reason}] saved {blob['states'].shape[0]} samples to {out_path}", flush=True)
+        print(f"[{reason}] saved {blob['states'].shape[0]} samples from {total_completed} games to {out_path}", flush=True)
 
     started = time.perf_counter()
-    games_completed = 0
     first_completion_at: Optional[float] = None  # elapsed when game 1 finishes
+    total_games = args.start_game + args.games  # total target including existing
 
     if args.engine == "mcts":
         # MCTS bootstrap mode: no neural net, pure tree search.
         # MCTS is CPU-bound so we use ProcessPoolExecutor for parallelism.
-        print(f"Starting MCTS bootstrap on {args.workers} worker(s)...", flush=True)
+        print(f"Starting MCTS bootstrap on {args.workers} worker(s) (games {args.start_game}..{total_games-1})...", flush=True)
         from concurrent.futures import ProcessPoolExecutor
         ctx = mp.get_context("spawn")
         manager = ctx.Manager()
@@ -453,7 +471,7 @@ def main() -> None:
         games_per_worker = args.games // args.workers
         remainder = args.games % args.workers
         worker_tasks = []
-        current_start = 0
+        current_start = args.start_game  # resume from here
         for i in range(args.workers):
             num = games_per_worker + (1 if i < remainder else 0)
             if num > 0:
@@ -482,7 +500,7 @@ def main() -> None:
                     if first_completion_at is None:
                         first_completion_at = elapsed
                     eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
-                    print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
+                    print(f"[{args.start_game + games_completed}/{total_games}] game={g_idx} samples={moves:3d} | "
                           f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
                     if args.save_every > 0 and games_completed % args.save_every == 0:
                         _flush("checkpoint")
@@ -505,7 +523,7 @@ def main() -> None:
     else:
         # PUCT mode (neural-guided)
         if args.workers == 1:
-            print(f"Starting 1 worker on {args.device} (batch_size={args.batch_size})...", flush=True)
+            print(f"Starting 1 worker on {args.device} (batch_size={args.batch_size}), games {args.start_game}..{total_games-1}...", flush=True)
             predictor = None
             if args.predictor_checkpoint:
                 predictor = PolicyValueModel(model_path=args.predictor_checkpoint, device=args.device)
@@ -514,7 +532,7 @@ def main() -> None:
                 
             # We can just run one big batch if it's 1 worker
             results = _play_batch_games(
-                start_game_idx=0,
+                start_game_idx=args.start_game,
                 num_games=args.games,
                 batch_size=args.batch_size,
                 seed_base=args.seed,
@@ -542,7 +560,7 @@ def main() -> None:
                 if first_completion_at is None:
                     first_completion_at = elapsed
                 eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
-                print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
+                print(f"[{args.start_game + games_completed}/{total_games}] game={g_idx} samples={moves:3d} | "
                       f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
                 if args.save_every > 0 and games_completed % args.save_every == 0:
                     _flush("checkpoint")
@@ -551,7 +569,7 @@ def main() -> None:
             games_per_worker = args.games // args.workers
             remainder = args.games % args.workers
             worker_tasks = []
-            current_start = 0
+            current_start = args.start_game  # resume from here
             for i in range(args.workers):
                 num = games_per_worker + (1 if i < remainder else 0)
                 if num > 0:
@@ -568,7 +586,7 @@ def main() -> None:
                     ))
                     current_start += num
 
-            print(f"Starting {args.workers} workers on {args.device} (batch_size={args.batch_size})...", flush=True)
+            print(f"Starting {args.workers} workers on {args.device} (batch_size={args.batch_size}), games {args.start_game}..{total_games-1}...", flush=True)
             from concurrent.futures import ProcessPoolExecutor
             ctx = mp.get_context("spawn")
             manager = ctx.Manager()
@@ -610,7 +628,7 @@ def main() -> None:
                         if first_completion_at is None:
                             first_completion_at = elapsed
                         eta_str = _format_eta(games_completed, args.games, elapsed, first_completion_at)
-                        print(f"[{games_completed}/{args.games}] game={g_idx} samples={moves:3d} | "
+                        print(f"[{args.start_game + games_completed}/{total_games}] game={g_idx} samples={moves:3d} | "
                               f"winner={winner} | total={elapsed:6.1f}s | eta={eta_str}", flush=True)
                         if args.save_every > 0 and games_completed % args.save_every == 0:
                             _flush("checkpoint")
