@@ -117,6 +117,9 @@ def _self_play(
     fast_iters: int = 10,
     full_search_fraction: float = 0.25,
     pass_penalty: float = 0.0,
+    resign_threshold: float = 0.9,
+    resign_min_moves: int = 30,
+    value_margin_scale: float = 20.0,
 ) -> None:
     if out_path.exists() and state.gen(gen_idx).get("self_play_done"):
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
@@ -130,6 +133,9 @@ def _self_play(
         "--fast-iters", str(fast_iters),
         "--full-search-fraction", str(full_search_fraction),
         "--pass-penalty", str(pass_penalty),
+        "--resign-threshold", str(resign_threshold),
+        "--resign-min-moves", str(resign_min_moves),
+        "--value-margin-scale", str(value_margin_scale),
         "--seed", str(seed_base + 100 * gen_idx),
         "--output", str(out_path),
         "--device", device,
@@ -279,6 +285,12 @@ def main() -> None:
                    help="Fraction of self-play turns that use the full iteration count.")
     p.add_argument("--self-play-pass-penalty", type=float, default=0.0,
                    help="Tiny penalty subtracted from pass move Q during self-play PUCT search.")
+    p.add_argument("--self-play-resign-threshold", type=float, default=0.9,
+                   help="Resign when root Q falls below this during self-play.")
+    p.add_argument("--self-play-resign-min-moves", type=int, default=30,
+                   help="Minimum moves before resignation is allowed in self-play.")
+    p.add_argument("--self-play-value-margin-scale", type=float, default=20.0,
+                   help="Scale factor for score-margin value targets (0 = binary ±1).")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -348,7 +360,10 @@ def main() -> None:
                    c_puct=args.c_puct,
                    fast_iters=args.self_play_fast_iters,
                    full_search_fraction=args.self_play_full_search_fraction,
-                   pass_penalty=args.self_play_pass_penalty)
+                   pass_penalty=args.self_play_pass_penalty,
+                   resign_threshold=args.self_play_resign_threshold,
+                   resign_min_moves=args.self_play_resign_min_moves,
+                   value_margin_scale=args.self_play_value_margin_scale)
 
         # Sliding replay window: train on the last `replay_window`
         # self-play datasets that actually exist on disk.

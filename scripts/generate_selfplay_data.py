@@ -82,6 +82,9 @@ def _play_batch_games(
     fast_iterations: int = 10,
     full_search_fraction: float = 0.25,
     pass_penalty: float = 0.0,
+    resign_threshold: float = 0.9,
+    resign_min_moves: int = 30,
+    value_margin_scale: float = 20.0,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
     """Plays multiple games using batched MCTS and returns a list of game results."""
     results = []
@@ -187,12 +190,25 @@ def _play_batch_games(
             game = active_games[i]
             root = roots_to_search[i]
             g_idx = active_indices[i]
-            
+
+            # Resignation: if current player is clearly losing, concede early
+            if not game.finished and len(game_states[i]) >= resign_min_moves and root.visit_count > 0:
+                if root.q < -resign_threshold:
+                    game.concede()
+
             visit_sum = sum(ch.visit_count for ch in root.children.values())
             if visit_sum <= 0 or not root.children or game.finished or len(game_states[i]) >= max_moves:
                 winner = game.score()["winner"]
                 p_list = game_players[i]
-                v_list = [1.0 if p == winner else -1.0 for p in p_list]
+
+                # Score-margin value targets instead of binary ±1
+                if value_margin_scale > 0.0:
+                    score_dict = game.score()
+                    margin = score_dict["black"] - score_dict["white"]
+                    scaled_margin = max(-1.0, min(1.0, margin / value_margin_scale))
+                    v_list = [scaled_margin if p == BLACK else -scaled_margin for p in p_list]
+                else:
+                    v_list = [1.0 if p == winner else -1.0 for p in p_list]
 
                 abs_owner = game.ownership_map()
                 own_list = []
@@ -304,6 +320,13 @@ def main() -> None:
                    help="Exploration constant for PUCT search.")
     p.add_argument("--pass-penalty", type=float, default=0.0,
                    help="Tiny penalty subtracted from pass move Q during PUCT selection (default: 0.0).")
+    p.add_argument("--resign-threshold", type=float, default=0.9,
+                   help="Resign when root Q falls below this (default: 0.9).")
+    p.add_argument("--resign-min-moves", type=int, default=30,
+                   help="Minimum moves before resignation is allowed (default: 30).")
+    p.add_argument("--value-margin-scale", type=float, default=20.0,
+                   help="Scale factor for score-margin value targets (default: 20.0). "
+                        "Set to 0.0 for binary ±1 targets.")
     args = p.parse_args()
 
     out_path = pathlib.Path(args.output)
@@ -349,6 +372,9 @@ def main() -> None:
             fast_iterations=args.fast_iters,
             full_search_fraction=args.full_search_fraction,
             pass_penalty=args.pass_penalty,
+            resign_threshold=args.resign_threshold,
+            resign_min_moves=args.resign_min_moves,
+            value_margin_scale=args.value_margin_scale,
         )
         for st, pol, val, own, moves, winner, g_idx in results:
             states.append(st)
@@ -406,6 +432,9 @@ def main() -> None:
                 fast_iterations=args.fast_iters,
                 full_search_fraction=args.full_search_fraction,
                 pass_penalty=args.pass_penalty,
+                resign_threshold=args.resign_threshold,
+                resign_min_moves=args.resign_min_moves,
+                value_margin_scale=args.value_margin_scale,
             )
             for t in worker_tasks
         ]
