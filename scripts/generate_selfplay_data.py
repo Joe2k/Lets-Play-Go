@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import pathlib
+import queue
 import random
 import sys
 import time
@@ -216,7 +217,7 @@ def main() -> None:
     p.add_argument("--no-noise", action="store_true")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--workers", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--c-puct", type=float, default=1.25,
                    help="Exploration constant for PUCT search.")
     args = p.parse_args()
@@ -323,10 +324,18 @@ def main() -> None:
                           f"winner={winner} | total={elapsed:6.1f}s | eta={eta:5.1f}s", flush=True)
                     if args.save_every > 0 and games_completed % args.save_every == 0:
                         _flush("checkpoint")
-                except:
-                    if all(f.done() for f in futs) and progress_queue.empty():
-                        break
-                    continue
+                except queue.Empty:
+                    # This happens when timeout=1.0 is reached
+                    pass
+                except Exception as e:
+                    print(f"Error reading from queue: {e}")
+                
+                # Check for completed or crashed workers
+                if all(f.done() for f in futs) and progress_queue.empty():
+                    for idx, f in enumerate(futs):
+                        if f.exception() is not None:
+                            print(f"\n[ERROR] Worker {idx} crashed with exception:\n{f.exception()}", file=sys.stderr)
+                    break
         except KeyboardInterrupt:
             print("\nInterrupted.")
             _flush("interrupted")
