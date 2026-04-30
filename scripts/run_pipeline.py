@@ -114,6 +114,8 @@ def _self_play(
     workers: int = 1,
     batch_size: int = 32,
     c_puct: float = 1.25,
+    fast_iters: int = 10,
+    full_search_fraction: float = 0.25,
 ) -> None:
     if out_path.exists() and state.gen(gen_idx).get("self_play_done"):
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
@@ -124,6 +126,8 @@ def _self_play(
         str(ROOT / "scripts" / "generate_selfplay_data.py"),
         "--games", str(games),
         "--iterations", str(iterations),
+        "--fast-iters", str(fast_iters),
+        "--full-search-fraction", str(full_search_fraction),
         "--seed", str(seed_base + 100 * gen_idx),
         "--output", str(out_path),
         "--device", device,
@@ -267,6 +271,10 @@ def main() -> None:
                    help="Self-play games per generation.")
     p.add_argument("--self-play-iters", type=int, default=200,
                    help="MCTS/PUCT iterations per move during self-play.")
+    p.add_argument("--self-play-fast-iters", type=int, default=10,
+                   help="MCTS/PUCT iterations for fast searches during self-play.")
+    p.add_argument("--self-play-full-search-fraction", type=float, default=0.25,
+                   help="Fraction of self-play turns that use the full iteration count.")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -333,7 +341,9 @@ def main() -> None:
                    seed_base=args.seed_base,
                    workers=self_play_workers,
                    batch_size=self_play_batch,
-                   c_puct=args.c_puct)
+                   c_puct=args.c_puct,
+                   fast_iters=args.self_play_fast_iters,
+                   full_search_fraction=args.self_play_full_search_fraction)
 
         # Sliding replay window: train on the last `replay_window`
         # self-play datasets that actually exist on disk.

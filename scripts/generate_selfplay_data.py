@@ -78,6 +78,8 @@ def _play_batch_games(
     c_puct: float = 1.25,
     progress_queue: Optional[mp.Queue] = None,
     predictor: Optional[PolicyValueModel] = None,
+    fast_iterations: int = 10,
+    full_search_fraction: float = 0.25,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
     """Plays multiple games using batched MCTS and returns a list of game results."""
     results = []
@@ -128,23 +130,45 @@ def _play_batch_games(
             if active_roots[i] is None:
                 active_roots[i] = PUCTNode(to_play=active_games[i].to_move, prior=1.0)
             roots_to_search.append(active_roots[i])
-            
+
+        # Playout Cap Randomization (PCR): per-turn full vs fast search
+        is_full_search = []
+        for i in range(len(active_games)):
+            decide_rng = random.Random(active_seeds[i] + 77777 + len(game_states[i]))
+            is_full_search.append(decide_rng.random() < full_search_fraction)
+
         if isinstance(current_predictor, PolicyValueModel):
+            # Fast search on all active games
             run_batched_puct_search(
                 games=active_games,
                 model=current_predictor,
-                iterations=iterations,
+                iterations=fast_iterations,
                 c_puct=c_puct,
                 roots=roots_to_search,
                 add_root_noise=add_root_noise,
                 rng=random.Random(active_seeds[0] if active_seeds else 0),
             )
+            # Additional iterations for games designated as full searches
+            full_indices = [i for i, flag in enumerate(is_full_search) if flag]
+            if full_indices and iterations > fast_iterations:
+                full_games = [active_games[i] for i in full_indices]
+                full_roots = [roots_to_search[i] for i in full_indices]
+                run_batched_puct_search(
+                    games=full_games,
+                    model=current_predictor,
+                    iterations=iterations - fast_iterations,
+                    c_puct=c_puct,
+                    roots=full_roots,
+                    add_root_noise=False,  # noise already applied in fast search
+                    rng=random.Random(active_seeds[0] if active_seeds else 0),
+                )
         else:
             for i in range(len(active_games)):
+                iters = iterations if is_full_search[i] else fast_iterations
                 run_puct_search(
                     game=active_games[i],
                     predictor=current_predictor,
-                    iterations=iterations,
+                    iterations=iters,
                     c_puct=c_puct,
                     root=roots_to_search[i],
                     add_root_noise=add_root_noise,
@@ -245,7 +269,12 @@ def main() -> None:
     require_torch()
     p = argparse.ArgumentParser(description="Generate PUCT self-play dataset")
     p.add_argument("--games", type=int, default=20)
-    p.add_argument("--iterations", type=int, default=120)
+    p.add_argument("--iterations", type=int, default=120,
+                   help="MCTS iterations for 'full' searches (default: 120).")
+    p.add_argument("--fast-iters", type=int, default=10,
+                   help="MCTS iterations for 'fast' searches (default: 10).")
+    p.add_argument("--full-search-fraction", type=float, default=0.25,
+                   help="Fraction of turns that use the full iteration count (default: 0.25).")
     p.add_argument("--max-moves", type=int, default=220)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
@@ -299,6 +328,8 @@ def main() -> None:
             c_puct=args.c_puct,
             progress_queue=None,
             predictor=predictor,
+            fast_iterations=args.fast_iters,
+            full_search_fraction=args.full_search_fraction,
         )
         for st, pol, val, moves, winner, g_idx in results:
             states.append(st)
@@ -348,7 +379,15 @@ def main() -> None:
             initargs=(args.predictor_checkpoint, args.device),
         )
         
-        futs = [pool.submit(_play_batch_games, *t, progress_queue=progress_queue) for t in worker_tasks]
+        futs = [
+            pool.submit(
+                _play_batch_games, *t,
+                progress_queue=progress_queue,
+                fast_iterations=args.fast_iters,
+                full_search_fraction=args.full_search_fraction,
+            )
+            for t in worker_tasks
+        ]
         
         try:
             while games_completed < args.games:
