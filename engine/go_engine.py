@@ -656,7 +656,7 @@ class GoGame:
                 for nidx in self._neighbors_of(s):
                     if self.board[nidx] == EMPTY:
                         liberties.add(nidx)
-            if len(liberties) > 1:
+            if len(liberties) > 2:
                 continue
 
             if not self._is_capturable(gid):
@@ -668,7 +668,12 @@ class GoGame:
         return dead_black, dead_white
 
     def _is_capturable(self, chain_gid: int) -> bool:
-        """Return True if the opponent can legally capture this chain."""
+        """Return True if the opponent can legally capture this chain.
+
+        Handles 0-liberty (already captured), 1-liberty (atari), and
+        2-liberty chains where both saving moves are suicide (e.g. filling
+        the last liberty captures your own group and doesn't capture enemy).
+        """
         gr = self._groups[chain_gid]
         liberties: set[int] = set()
         for s in gr.stones:
@@ -677,14 +682,43 @@ class GoGame:
                     liberties.add(nidx)
         if not liberties:
             return True
-        if len(liberties) != 1:
-            return False
-        lib = liberties.pop()
-        r, c = divmod(lib, SIZE)
-        probe = self.clone_fast()
-        probe.to_move = _other(gr.color)
-        probe.finished = False
-        return probe.place_stone(r, c)
+
+        if len(liberties) == 1:
+            lib = liberties.pop()
+            r, c = divmod(lib, SIZE)
+            probe = self.clone_fast()
+            probe.to_move = _other(gr.color)
+            probe.finished = False
+            return probe.place_stone(r, c)
+
+        if len(liberties) == 2:
+            # Two-ply lookahead: opponent plays one liberty, defender tries the other.
+            fatal_for_both = True
+            for lib_a in liberties:
+                r, c = divmod(lib_a, SIZE)
+                probe1 = self.clone_fast()
+                probe1.to_move = _other(gr.color)
+                probe1.finished = False
+                if not probe1.place_stone(r, c):
+                    # Opponent can't legally play here; this path is moot.
+                    continue
+
+                remaining = liberties - {lib_a}
+                if not remaining:
+                    return True  # captured immediately
+
+                lib_b = remaining.pop()
+                r2, c2 = divmod(lib_b, SIZE)
+                probe2 = probe1.clone_fast()
+                probe2.to_move = gr.color
+                probe2.finished = False
+                if probe2.place_stone(r2, c2):
+                    # Defender can save; chain is alive.
+                    fatal_for_both = False
+                    break
+            return fatal_for_both
+
+        return False
 
     def _score_with_dead_removed(
         self, dead: set[int]
