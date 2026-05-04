@@ -9,7 +9,7 @@ from typing import Optional, Protocol, Union
 
 from engine.go_engine import BLACK, SIZE, WHITE, GoGame
 
-from .mcts import candidate_moves
+from .mcts import _move_features, candidate_moves
 from .model import PASS_INDEX, PolicyValueModel, require_torch
 
 Move = Union[tuple[int, int], str]
@@ -17,6 +17,33 @@ PASS_MOVE: str = "pass"
 
 _DIRICHLET_ALPHA = 0.03
 _DIRICHLET_WEIGHT = 0.25
+_TACTICAL_BOOST_FACTOR = 5.0
+
+
+def _apply_tactical_boost(
+    priors: list[tuple[Move, float]],
+    game: GoGame,
+    boost_factor: float,
+) -> list[tuple[Move, float]]:
+    """Boost priors for moves that capture or escape atari.
+
+    Reuses MCTS's _move_features to identify tactical moves.
+    The boost is multiplicative: prior *= (1 + boost_factor * priority_score).
+    """
+    if boost_factor <= 0.0:
+        return priors
+
+    boosted: list[tuple[Move, float]] = []
+    for move, p in priors:
+        if move == PASS_MOVE:
+            boosted.append((move, p))
+            continue
+        cap, escape, _, _ = _move_features(game, move)
+        if cap >= 1 or escape >= 1:
+            priority = 100 * cap + 35 * escape
+            p = p * (1.0 + boost_factor * priority / 100.0)
+        boosted.append((move, p))
+    return boosted
 
 
 def _sample_from_visits(visits: dict, rng: random.Random, temperature: float):
@@ -92,13 +119,23 @@ def _try_apply_move(sim: GoGame, move: Move) -> bool:
     return sim.place_stone(*move)
 
 
-def _expand_node(node: PUCTNode, game: GoGame, predictor: Predictor) -> float:
+def _expand_node(
+    node: PUCTNode,
+    game: GoGame,
+    predictor: Predictor,
+    tactical_boost: float = 0.0,
+) -> float:
     probs, value = predictor.predict(game)
-    _expand_node_from_data(node, game, probs)
+    _expand_node_from_data(node, game, probs, tactical_boost=tactical_boost)
     return value
 
 
-def _expand_node_from_data(node: PUCTNode, game: GoGame, probs: list[float]) -> None:
+def _expand_node_from_data(
+    node: PUCTNode,
+    game: GoGame,
+    probs: list[float],
+    tactical_boost: float = 0.0,
+) -> None:
     legal_moves = candidate_moves(game)
 
     priors: list[tuple[Move, float]] = []
@@ -111,6 +148,10 @@ def _expand_node_from_data(node: PUCTNode, game: GoGame, probs: list[float]) -> 
     pass_prior = probs[PASS_INDEX] if len(probs) > PASS_INDEX else 0.0
     priors.append((PASS_MOVE, pass_prior))
     total += pass_prior
+
+    if tactical_boost > 0.0:
+        priors = _apply_tactical_boost(priors, game, tactical_boost)
+        total = sum(p for _, p in priors)
 
     if total <= 1e-12:
         total = float(len(priors))
@@ -149,11 +190,12 @@ def run_puct_search(
     rng: Optional[random.Random] = None,
     max_descent_depth: int = _MAX_DESCENT_DEPTH,
     pass_penalty: float = 0.0,
+    tactical_boost: float = 0.0,
 ) -> PUCTNode:
     if root is None:
         root = PUCTNode(to_play=game.to_move, prior=1.0)
     if not root.expanded:
-        _expand_node(root, game, predictor)
+        _expand_node(root, game, predictor, tactical_boost=tactical_boost)
     if add_root_noise:
         _add_dirichlet_noise(root, rng or random.Random())
 
@@ -180,7 +222,7 @@ def run_puct_search(
             winner = sim.score()["winner"]
             leaf_value = 1.0 if winner == node.to_play else -1.0
         elif not node.expanded:
-            leaf_value = _expand_node(node, sim, predictor)
+            leaf_value = _expand_node(node, sim, predictor, tactical_boost=tactical_boost)
         elif not node.children:
             leaf_value = -1.0
         else:
@@ -206,11 +248,12 @@ def run_batched_puct_search(
     rng: Optional[random.Random] = None,
     max_descent_depth: int = _MAX_DESCENT_DEPTH,
     pass_penalty: float = 0.0,
+    tactical_boost: float = 0.0,
 ) -> list[PUCTNode]:
     """Run MCTS iterations for a batch of games in parallel, batching NN evaluations."""
     for i, root in enumerate(roots):
         if not root.expanded:
-            _expand_node(root, games[i], model)
+            _expand_node(root, games[i], model, tactical_boost=tactical_boost)
         if add_root_noise:
             _add_dirichlet_noise(root, rng or random.Random())
 
@@ -258,7 +301,7 @@ def run_batched_puct_search(
             for i, idx in enumerate(to_predict_indices):
                 node = leaf_nodes[idx]
                 sim = to_predict_sims[i]
-                _expand_node_from_data(node, sim, probs_list[i])
+                _expand_node_from_data(node, sim, probs_list[i], tactical_boost=tactical_boost)
                 leaf_values[idx] = values[i]
 
         for i in range(len(games)):
@@ -282,6 +325,7 @@ class PUCTAgent:
         add_root_noise: bool = False,
         pass_penalty: float = 0.0,
         eval_temperature: float = 0.0,
+        tactical_boost: float = 0.0,
     ) -> None:
         require_torch()
         self.iterations = iterations
@@ -291,6 +335,7 @@ class PUCTAgent:
         self.model = PolicyValueModel(model_path=model_path, device=device)
         self.add_root_noise = add_root_noise
         self.eval_temperature = eval_temperature
+        self.tactical_boost = tactical_boost
         self._root: Optional[PUCTNode] = None
         self._last_to_play: Optional[int] = None
 
@@ -310,18 +355,38 @@ class PUCTAgent:
             add_root_noise=self.add_root_noise,
             rng=self._rng,
             pass_penalty=self.pass_penalty,
+            tactical_boost=self.tactical_boost,
         )
         if not self._root.children:
             return PASS_MOVE
+
+        # Prefer board moves over pass. Only pass if no board moves exist.
+        board_children = {m: c for m, c in self._root.children.items() if m != PASS_MOVE}
+        if not board_children:
+            return PASS_MOVE
+
         if self.eval_temperature > 0.0:
-            visits = {move: child.visit_count for move, child in self._root.children.items()}
-            best = _sample_from_visits(visits, self._rng, self.eval_temperature)
-        else:
-            best = max(self._root.children.items(), key=lambda kv: kv[1].visit_count)[0]
-        # Promote chosen child to next root for tree reuse.
-        self._root = self._root.children[best]
-        self._last_to_play = _other(game.to_move)
-        return best
+            visits = {move: child.visit_count for move, child in board_children.items()}
+            for _ in range(20):
+                move = _sample_from_visits(visits, self._rng, self.eval_temperature)
+                probe = game.clone_fast()
+                if probe.place_stone(*move):
+                    self._root = self._root.children[move]
+                    self._last_to_play = _other(game.to_move)
+                    return move
+            # Fall back to deterministic scan if sampling fails.
+
+        # Sort by visit count descending, then pick the first legal move.
+        ordered = sorted(board_children.items(), key=lambda kv: kv[1].visit_count, reverse=True)
+        for move, child in ordered:
+            probe = game.clone_fast()
+            if probe.place_stone(*move):
+                self._root = self._root.children[move]
+                self._last_to_play = _other(game.to_move)
+                return move
+
+        # All board moves are illegal — pass.
+        return PASS_MOVE
 
     def _advance_root_to(self, game: GoGame) -> None:
         """Descend the stored root to mirror the opponent's last move, if known."""

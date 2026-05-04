@@ -92,6 +92,13 @@ def coord_label(r: int, c: int) -> str:
     return f"{COL_LABELS[c]}{SIZE - r}"
 
 
+def _draw_stone_indicator(surf: pygame.Surface, color: int, cx: int, cy: int, r: int = 7):
+    """Draw a small stone circle with outline at the given center."""
+    stone_c = STONE_B if color == BLACK else STONE_W
+    pygame.draw.circle(surf, stone_c, (cx, cy), r)
+    pygame.draw.circle(surf, STONE_OUTLINE, (cx, cy), r, 1)
+
+
 def intersection_xy(r: int, c: int) -> tuple[int, int]:
     return (MARGIN + c * CELL_PX, MARGIN + r * CELL_PX)
 
@@ -199,7 +206,7 @@ class App:
 
     def _build_agent(self):
         if self.ai_engine == "puct":
-            return PUCTAgent(iterations=self.ai_iterations, model_path=self.model_path, seed=self.seed)
+            return PUCTAgent(iterations=self.ai_iterations, model_path=self.model_path, seed=self.seed, tactical_boost=2)
         return MCTSAgent(iterations=self.ai_iterations, seed=self.seed)
 
     # --- Main loop ---
@@ -370,10 +377,23 @@ class App:
         self.screen.blit(title, title.get_rect(center=(cx, cy - 80)))
         subtitle = self.font.render("Choose your color", True, TEXT_C)
         self.screen.blit(subtitle, subtitle.get_rect(center=(cx, cy - 30)))
-        note = self.small_font.render("Black moves first. Pass = concede.", True, TEXT_C)
-        self.screen.blit(note, note.get_rect(center=(cx, cy)))
+
+        note_text = "Black moves first. Pass = concede."
+        note = self.small_font.render(note_text, True, TEXT_C)
+        note_rect = note.get_rect(center=(cx, cy))
+        _draw_stone_indicator(self.screen, BLACK, note_rect.left - 12, cy + 1, r=5)
+        self.screen.blit(note, note_rect)
+
         mouse = pygame.mouse.get_pos()
+
+        # Black button with stone indicator
+        b_rect = self.start_black_btn.rect
+        _draw_stone_indicator(self.screen, BLACK, b_rect.left - 14, b_rect.centery, r=8)
         self.start_black_btn.draw(self.screen, self.font, hover=self.start_black_btn.hit(mouse))
+
+        # White button with stone indicator
+        w_rect = self.start_white_btn.rect
+        _draw_stone_indicator(self.screen, WHITE, w_rect.left - 14, w_rect.centery, r=8)
         self.start_white_btn.draw(self.screen, self.font, hover=self.start_white_btn.hit(mouse))
 
     def _render_board(self) -> None:
@@ -450,12 +470,16 @@ class App:
         # --- Players ---
         you_color = "Black" if self.human_color == BLACK else "White"
         ai_color = "White" if self.human_color == BLACK else "Black"
+        pygame.draw.circle(self.screen, STONE_B if self.human_color == BLACK else STONE_W, (x + 8, y + 8), 7)
+        pygame.draw.circle(self.screen, STONE_OUTLINE, (x + 8, y + 8), 7, 1)
         ht = self.small_font.render(f"You: {you_color}", True, TEXT_C)
+        self.screen.blit(ht, (x + 20, y))
+        pygame.draw.circle(self.screen, STONE_B if self.human_color == WHITE else STONE_W, (x + 8, y + 26), 7)
+        pygame.draw.circle(self.screen, STONE_OUTLINE, (x + 8, y + 26), 7, 1)
         at = self.small_font.render(
             f"AI: {ai_color} ({self.ai_engine.upper()} {self.ai_iterations})", True, TEXT_MUTED,
         )
-        self.screen.blit(ht, (x, y))
-        self.screen.blit(at, (x, y + 18))
+        self.screen.blit(at, (x + 20, y + 18))
         y += 45
 
         # --- Turn ---
@@ -470,26 +494,30 @@ class App:
         y += 40
 
         # --- Captures ---
-        cb = self.font.render(f"Black captures: {self.game.captures[BLACK]}", True, TEXT_C)
-        cw = self.font.render(f"White captures: {self.game.captures[WHITE]}", True, TEXT_C)
-        self.screen.blit(cb, (x, y))
-        self.screen.blit(cw, (x, y + 25))
+        _draw_stone_indicator(self.screen, BLACK, x + 8, y + 8, r=6)
+        cb = self.font.render(f"captures: {self.game.captures[BLACK]}", True, TEXT_C)
+        self.screen.blit(cb, (x + 20, y))
+        _draw_stone_indicator(self.screen, WHITE, x + 8, y + 33, r=6)
+        cw = self.font.render(f"captures: {self.game.captures[WHITE]}", True, TEXT_C)
+        self.screen.blit(cw, (x + 20, y + 25))
         y += 60
 
         # --- Score (exact final, with dead-stone removal) ---
         sc = self.game.score_final()
         sh = self.font.render("Score:", True, TEXT_C)
         self.screen.blit(sh, (x, y))
+        _draw_stone_indicator(self.screen, BLACK, x + 8, y + 30, r=5)
         bs = self.small_font.render(
-            f"Black: {sc['black']:.1f}  ({sc['black_stones']}+{sc['black_territory']})",
+            f"{sc['black']:.1f}  ({sc['black_stones']}+{sc['black_territory']})",
             True, TEXT_C,
         )
+        self.screen.blit(bs, (x + 20, y + 22))
+        _draw_stone_indicator(self.screen, WHITE, x + 8, y + 48, r=5)
         ws = self.small_font.render(
-            f"White: {sc['white']:.1f}  ({sc['white_stones']}+{sc['white_territory']}+{sc['komi']})",
+            f"{sc['white']:.1f}  ({sc['white_stones']}+{sc['white_territory']}+{sc['komi']})",
             True, TEXT_C,
         )
-        self.screen.blit(bs, (x, y + 22))
-        self.screen.blit(ws, (x, y + 40))
+        self.screen.blit(ws, (x + 20, y + 40))
         y += 70
 
         # --- Last Moves ---
@@ -581,18 +609,24 @@ class App:
         cy = WINDOW_H // 2
 
         ts = self.title_font.render(f"{winner_name} wins", True, OVERLAY_TEXT_C)
-        self.screen.blit(ts, ts.get_rect(center=(cx, cy - 90)))
+        title_rect = ts.get_rect(center=(cx, cy - 90))
+        _draw_stone_indicator(self.screen, s["winner"], title_rect.left - 16, cy - 90, r=10)
+        self.screen.blit(ts, title_rect)
         sub = self.font.render(outcome, True, OVERLAY_TEXT_C)
         self.screen.blit(sub, sub.get_rect(center=(cx, cy - 50)))
 
         lines = [
-            f"Black: {s['black_stones']} stones + {s['black_territory']} territory = {s['black']:.1f}",
-            f"White: {s['white_stones']} + {s['white_territory']} + {s['komi']} komi = {s['white']:.1f}",
-            f"Neutral (dame): {s['neutral_points']}",
+            (BLACK, f"{s['black_stones']} stones + {s['black_territory']} territory = {s['black']:.1f}"),
+            (WHITE, f"{s['white_stones']} + {s['white_territory']} + {s['komi']} komi = {s['white']:.1f}"),
+            (None, f"Neutral (dame): {s['neutral_points']}"),
         ]
-        for i, line in enumerate(lines):
+        for i, (color, line) in enumerate(lines):
             t = self.small_font.render(line, True, OVERLAY_TEXT_C)
-            self.screen.blit(t, t.get_rect(center=(cx, cy - 10 + i * 22)))
+            tx = cx - t.get_width() // 2
+            ty = cy - 10 + i * 22
+            if color is not None:
+                _draw_stone_indicator(self.screen, color, tx - 14, ty + 7, r=6)
+            self.screen.blit(t, (tx, ty))
 
         mouse = pygame.mouse.get_pos()
         self.over_new_btn.draw(self.screen, self.font, hover=self.over_new_btn.hit(mouse))
@@ -611,9 +645,9 @@ def run_app(
 def main() -> None:
     p = argparse.ArgumentParser(description="9x9 Go vs MCTS/PUCT AI")
     p.add_argument("--human-color", choices=["black", "white"], default="black")
-    p.add_argument("--ai-iterations", type=int, default=400)
+    p.add_argument("--ai-iterations", type=int, default=800)
     p.add_argument("--engine", choices=["mcts", "puct"], default="puct")
-    p.add_argument("--model-path", type=str, default="model/model_v1.pt")
+    p.add_argument("--model-path", type=str, default="model/model_v10.pt")
     p.add_argument("--seed", type=int, default=None)
     args = p.parse_args()
     color = BLACK if args.human_color == "black" else WHITE
