@@ -77,6 +77,7 @@ def _play_batch_games(
     resign_threshold: float = 0.9,
     resign_min_moves: int = 30,
     value_margin_scale: float = 20.0,
+    tactical_boost: float = 0.0,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]]:
     """Plays multiple games using batched MCTS and returns a list of game results."""
     results = []
@@ -147,6 +148,7 @@ def _play_batch_games(
                 add_root_noise=add_root_noise,
                 rng=random.Random(active_seeds[0] if active_seeds else 0),
                 pass_penalty=pass_penalty,
+                tactical_boost=tactical_boost,
             )
             # Additional iterations for games designated as full searches
             full_indices = [i for i, flag in enumerate(is_full_search) if flag]
@@ -162,6 +164,7 @@ def _play_batch_games(
                     add_root_noise=False,  # noise already applied in fast search
                     rng=random.Random(active_seeds[0] if active_seeds else 0),
                     pass_penalty=pass_penalty,
+                    tactical_boost=tactical_boost,
                 )
         else:
             for i in range(len(active_games)):
@@ -175,6 +178,7 @@ def _play_batch_games(
                     add_root_noise=add_root_noise,
                     rng=random.Random(active_seeds[i]),
                     pass_penalty=pass_penalty,
+                    tactical_boost=tactical_boost,
                 )
         
         indices_to_remove = []
@@ -442,6 +446,9 @@ def main() -> None:
                    help="Self-play engine: puct (neural-guided, default) or mcts "
                         "(pure Monte-Carlo tree search, no neural net needed). "
                         "Use mcts for gen 0 bootstrap when no checkpoint exists.")
+    p.add_argument("--tactical-boost", type=float, default=0.0,
+                   help="Multiply PUCT priors for capture/escape atari moves. "
+                        "0 = no boost (default). 2.0 is a moderate tweak.")
     p.add_argument("--start-game", type=int, default=0,
                    help="Resume from this game index (append to existing output file).")
     args = p.parse_args()
@@ -571,6 +578,7 @@ def main() -> None:
                 resign_threshold=args.resign_threshold,
                 resign_min_moves=args.resign_min_moves,
                 value_margin_scale=args.value_margin_scale,
+                tactical_boost=args.tactical_boost,
             )
             for st, pol, val, own, moves, winner, g_idx in results:
                 states.append(st)
@@ -605,6 +613,7 @@ def main() -> None:
                         args.temperature,
                         not args.no_noise,
                         args.c_puct,
+                        args.tactical_boost,
                     ))
                     current_start += num
 

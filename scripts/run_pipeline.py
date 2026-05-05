@@ -121,6 +121,7 @@ def _self_play(
     resign_min_moves: int = 30,
     value_margin_scale: float = 20.0,
     max_moves: int = 220,
+    tactical_boost: float = 0.0,
 ) -> None:
     if out_path.exists() and state.gen(gen_idx).get("self_play_done"):
         print(f"[gen {gen_idx}] self-play already complete, skipping.")
@@ -160,6 +161,7 @@ def _self_play(
         "--resign-min-moves", str(resign_min_moves),
         "--value-margin-scale", str(value_margin_scale),
         "--max-moves", str(max_moves),
+        "--tactical-boost", str(tactical_boost),
         "--seed", str(seed_base + 100 * gen_idx),
         "--output", str(out_path),
         "--device", device,
@@ -373,6 +375,9 @@ def main() -> None:
     p.add_argument("--self-play-batch-size", type=int, default=None,
                    help="Concurrent games per self-play worker (lockstep batched MCTS). "
                         "Defaults to --batch-size. Larger = more GPU saturation per worker.")
+    p.add_argument("--tactical-boost", type=float, default=0.0,
+                   help="PUCT tactical boost during self-play (default 0). "
+                        "2.0 is a moderate value that increases priors for captures/escapes.")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--seed-base", type=int, default=0)
     args = p.parse_args()
@@ -416,7 +421,8 @@ def main() -> None:
                    resign_threshold=args.self_play_resign_threshold,
                    resign_min_moves=args.self_play_resign_min_moves,
                    value_margin_scale=args.self_play_value_margin_scale,
-                   max_moves=args.self_play_max_moves)
+                   max_moves=args.self_play_max_moves,
+                   tactical_boost=args.tactical_boost)
 
         # Sliding replay window: train on the last `replay_window`
         # self-play datasets that actually exist on disk.
