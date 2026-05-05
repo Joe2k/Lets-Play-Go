@@ -613,7 +613,6 @@ def main() -> None:
                         args.temperature,
                         not args.no_noise,
                         args.c_puct,
-                        args.tactical_boost,
                     ))
                     current_start += num
 
@@ -640,6 +639,7 @@ def main() -> None:
                     resign_threshold=args.resign_threshold,
                     resign_min_moves=args.resign_min_moves,
                     value_margin_scale=args.value_margin_scale,
+                    tactical_boost=args.tactical_boost,
                 )
                 for t in worker_tasks
             ]
